@@ -10,20 +10,69 @@ import yfinance as yf
 
 @st.cache_data(ttl=300, show_spinner=False)
 def download_market_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
-    df = yf.download(symbol, period=period, interval=interval, auto_adjust=False,
-                     progress=False, threads=False)
+    """Load OHLCV from Yahoo with a second API path and useful diagnostics.
+
+    Yahoo can occasionally return an empty dataframe from the download endpoint
+    even when the ticker is valid. The Ticker.history path is used as a fallback.
+    """
+    symbol = symbol.strip().upper()
+    if not symbol:
+        return pd.DataFrame()
+
+    attempts = []
+    try:
+        df = yf.download(
+            symbol,
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+            timeout=30,
+        )
+        attempts.append(df)
+    except Exception:
+        attempts.append(pd.DataFrame())
+
+    if not attempts[0].empty:
+        df = attempts[0]
+    else:
+        try:
+            # Fallback for environments where yf.download intermittently fails.
+            df = yf.Ticker(symbol).history(
+                period=period,
+                interval=interval,
+                auto_adjust=False,
+                actions=False,
+                raise_errors=False,
+            )
+        except Exception:
+            df = pd.DataFrame()
+
     if df is None or df.empty:
         return pd.DataFrame()
+
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+        # Normalize both (field, ticker) and (ticker, field) layouts.
+        fields = {"Open", "High", "Low", "Close", "Volume"}
+        first_level = [str(c[0]) for c in df.columns]
+        if fields.intersection(first_level):
+            df.columns = [str(c[0]) for c in df.columns]
+        else:
+            df.columns = [str(c[-1]) for c in df.columns]
+
     df = df.rename(columns={str(c): str(c).title() for c in df.columns})
     required = ["Open", "High", "Low", "Close", "Volume"]
     if any(c not in df.columns for c in required):
         return pd.DataFrame()
+
     df = df[required].copy()
     for c in required:
         df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df.dropna(subset=["Open", "High", "Low", "Close"]).sort_index()
+
+    df = df.dropna(subset=["Open", "High", "Low", "Close"])
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    return df
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -216,8 +265,8 @@ def render_app():
 
     df = download_market_data(symbol, period, interval)
     if df.empty:
-        st.error("No market data returned. Check ticker and interval/history compatibility.")
-        st.info("Intraday Yahoo Finance data has shorter history limits; try a shorter History value.")
+        st.error(f"No market data returned for {symbol} ({interval}, {period}). Yahoo Finance may be temporarily unavailable or the symbol/history combination may be invalid.")
+        st.info("Try 1d + 1mo first. Intraday Yahoo Finance data has shorter history limits. Then click Load / Refresh.")
         return
 
     x = add_indicators(df)
@@ -258,4 +307,3 @@ def render_app():
         st.write(f"Risk budget: ₹{capital*risk_pct/100:,.0f}")
         st.write(f"ATR(14): ₹{_num(x.iloc[-1].get('ATR_14')):,.2f}")
         st.write(f"Risk-based paper quantity: {qty:,}")
-''
