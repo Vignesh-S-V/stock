@@ -442,7 +442,7 @@ def render_app() -> None:
         st.markdown("**Risk engine**")
         capital = st.number_input("Paper capital (₹)", min_value=10000.0, value=100000.0, step=10000.0, key="capital")
         risk_pct = st.slider("Risk per trade", 0.1, 3.0, 1.0, 0.1, format="%.1f%%", key="risk_pct")
-        brokerage = st.number_input("Brokerage + slippage", 0.0, 0.50, 0.03, 0.01, format="%.2f%%", key="brokerage")
+        brokerage = st.number_input("Brokerage + slippage (%)", 0.0, 0.50, 0.03, 0.01, format="%.2f", key="brokerage")
         reward_r = st.number_input("Reward / Risk", 2.0, 5.0, 2.0, 0.5, key="reward_r")
         st.caption("Default execution model: 1R stop · 2R target. Intrabar stop wins if both levels are touched.")
         auto = st.checkbox("Auto paper trading · refresh 60s", value=False, key="auto")
