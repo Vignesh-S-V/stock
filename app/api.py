@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from dataclasses import asdict, dataclass
 from typing import Any
@@ -13,7 +14,7 @@ from app.live_feed import fetch_live_1m
 from app.option_chain import build_option_recommendation, fetch_bse_sensex_chain, fetch_nse_chain
 from app.trading import INDEX_UNIVERSE, POPULAR_STOCKS, add_indicators, position_size, score_signal
 
-app = FastAPI(title="Algo Trading Pro API", version="1.1.0")
+app = FastAPI(title="Algo Trading Pro API", version="1.1.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 INDEX_OPTION_SYMBOLS = {"NIFTY 50": "NIFTY", "BANK NIFTY": "BANKNIFTY", "SENSEX": "SENSEX"}
@@ -57,11 +58,20 @@ def account_for(client_id: str, capital: float = 100000.0) -> PaperAccount:
     return accounts[client_id]
 
 
-def yahoo_last(symbol: str) -> float | None:
-    d = fetch_live_1m(symbol, "1d")
-    if d is None or d.empty:
-        return None
-    return float(d.Close.iloc[-1])
+def _json_safe(value: Any) -> Any:
+    """Convert pandas/numpy/non-finite values to strict JSON-safe values."""
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if hasattr(value, "item") and not isinstance(value, (str, bytes)):
+        try:
+            return _json_safe(value.item())
+        except (ValueError, TypeError):
+            pass
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    return value
 
 
 def market_snapshot(symbol: str) -> tuple[pd.DataFrame | None, float | None]:
@@ -176,7 +186,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                 pass
             x, price = await asyncio.to_thread(market_snapshot, config["symbol"])
             if x is None or price is None:
-                await ws.send_json({"type": "error", "message": "Live market data unavailable", "timestamp": time.time()})
+                payload = {"type": "error", "message": "Live market data unavailable", "timestamp": time.time()}
             else:
                 result = await asyncio.to_thread(execute_paper, account, x, config["strategy"], float(config["risk_pct"]), float(config["brokerage_pct"]), float(config["reward_r"]), float(config["threshold"]), bool(config["strict"]), bool(config["auto"]))
                 indices: dict[str, Any] = {}
@@ -185,7 +195,9 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                 result["type"] = "tick"
                 result["symbol"] = config["symbol"]
                 result["indices"] = indices
-                await ws.send_json(result)
+                payload = result
+            # Browser JSON.parse rejects NaN/Infinity even though Python's JSON encoder permits them.
+            await ws.send_json(_json_safe(payload))
             await asyncio.sleep(1.0)
     except (WebSocketDisconnect, RuntimeError):
         accounts.pop(client_id, None)
