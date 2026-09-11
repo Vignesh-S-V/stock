@@ -6,7 +6,8 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from app.live_feed import fetch_live_1m
-from app.paper_engine import _money, _position_from_state, _init_state, process_latest_bar, reset_paper_account
+from app.live_paper import live_paper_step
+from app.paper_engine import _money, _position_from_state, _init_state, reset_paper_account
 from app.trading import INDEX_UNIVERSE, PERIODS, POPULAR_STOCKS, add_indicators, backtest, position_size, regime_label, score_signal
 
 STRATEGIES = ["Ensemble", "Trend Momentum", "EMA Crossover", "RSI Reversion", "MACD", "Mean Reversion"]
@@ -18,9 +19,10 @@ def _now():
 
 def _data(symbol, period, interval):
     try:
-        d = fetch_live_1m(symbol, period if interval in {"1m", "5m"} else "1d") if interval in {"1m", "5m"} else None
-        if d is not None and not d.empty:
-            return d
+        if interval in {"1m", "5m"}:
+            d = fetch_live_1m(symbol, period)
+            if d is not None and not d.empty:
+                return d
         import yfinance as yf
         d = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False, threads=False)
         if hasattr(d.columns, "levels"):
@@ -56,13 +58,14 @@ def _style():
     .signal{border:1px solid #2c3a48;border-radius:15px;padding:17px;background:#0d141c}.action{font-size:46px;font-weight:950;line-height:1}.buy{color:#58e39b}.sell{color:#ff7076}.hold{color:#e7c85b}
     div[data-testid="stMetric"]{background:#0e151d;border:1px solid #222e3a;border-radius:12px;padding:8px 10px}
     .livebar{font-size:10px;color:#6ee39a;font-weight:850;letter-spacing:.5px;margin:2px 0 6px}
+    .tradeevent{border:1px solid #355a48;border-radius:10px;padding:9px 12px;background:#0d1b15;color:#8fe0ad;font-weight:750}
     </style>
     """, unsafe_allow_html=True)
 
 
 @st.fragment(run_every="1s")
-def _live_market_fragment(index_snapshot: list[tuple[str, str, float]], symbol: str, fallback_price: float):
-    """Only this block reruns every second; the rest of the dashboard stays static."""
+def _live_market_fragment(index_snapshot: list[tuple[str, str, float]], symbol: str, fallback_price: float, strategy: str, risk: float, brokerage: float, reward: float, threshold: float, strict: bool, trade_mode: str):
+    """Only live quotes and the paper-trade state rerun every second."""
     rows = []
     for name, ticker, fallback in index_snapshot:
         live = fetch_live_1m(ticker, "1d")
@@ -70,25 +73,55 @@ def _live_market_fragment(index_snapshot: list[tuple[str, str, float]], symbol: 
         rows.append((name, ticker, price))
 
     selected = fetch_live_1m(symbol, "1d")
-    selected_price = float(selected.Close.iloc[-1]) if selected is not None and not selected.empty else fallback_price
+    live_x = selected if selected is not None and not selected.empty else None
+    selected_price = float(live_x.Close.iloc[-1]) if live_x is not None else fallback_price
 
-    st.markdown("<div class='livebar'>● LIVE QUOTES · SERVER-SIDE 1 SECOND POLLING · ONLY THESE NUMBERS UPDATE</div>", unsafe_allow_html=True)
+    result = None
+    force_action = None
+    if live_x is not None:
+        live_x = add_indicators(live_x)
+        auto = trade_mode == "Auto Paper"
+        result = live_paper_step(live_x, strategy, risk, brokerage, reward, threshold, strict, auto)
+
+    st.markdown("<div class='livebar'>● LIVE · SERVER-SIDE 1 SECOND POLLING · QUOTES + PAPER P/L ONLY</div>", unsafe_allow_html=True)
     cols = st.columns(3)
     for col, (name, ticker, price) in zip(cols, rows):
         with col:
             st.metric(name, f"₹{price:,.2f}", help=f"{ticker} · refreshed {_now()}")
 
-    # Read the current session state on EVERY fragment run. This is important:
-    # the paper position can be opened by the main app after the fragment first mounts.
-    position_state = st.session_state.get("paper_position")
-    if position_state:
-        pos = _position_from_state(position_state)
+    if result:
+        sig_action = result["action"]
+        qualified = result["qualified"]
+        pos = result["position"]
+        if trade_mode == "Suggestion Only" and pos is None and qualified:
+            st.info(f"SIGNAL SUGGESTION: {'🟢 BUY' if sig_action == 'BUY' else '🔴 SELL / SHORT'} · Entry ₹{selected_price:,.2f} · Target {_money(result['target'])} · Stop {_money(result['stop'])}")
+            b1, b2 = st.columns(2)
+            with b1:
+                if sig_action == "BUY" and st.button("BUY PAPER", use_container_width=True, key="live_buy"):
+                    force_action = "BUY"
+            with b2:
+                if sig_action == "SELL" and st.button("SELL / SHORT PAPER", use_container_width=True, key="live_sell"):
+                    force_action = "SELL"
+            if force_action:
+                result = live_paper_step(live_x, strategy, risk, brokerage, reward, threshold, strict, False, force_action)
+                pos = result["position"]
+        elif trade_mode == "Suggestion Only" and pos is not None:
+            st.info(f"PAPER {pos.side} OPEN · Target {_money(pos.target)} · Stop {_money(pos.stop)} · waiting for target/stop or signal flip")
+
+        pos = _position_from_state(st.session_state.get("paper_position"))
         if pos:
             pnl = (selected_price - pos.entry) * pos.qty if pos.side == "LONG" else (pos.entry - selected_price) * pos.qty
-            p1, p2, p3 = st.columns(3)
+            p1, p2, p3, p4 = st.columns(4)
             p1.metric("PAPER LIVE PRICE", f"₹{selected_price:,.2f}")
             p2.metric("ENTRY", _money(pos.entry))
-            p3.metric("UNREALISED P/L", f"{'+' if pnl >= 0 else '-'}₹{abs(pnl):,.2f}")
+            p3.metric("LIVE P/L", f"{'+' if pnl >= 0 else '-'}₹{abs(pnl):,.2f}")
+            p4.metric("TARGET", _money(pos.target))
+            if result.get("event"):
+                st.markdown(f"<div class='tradeevent'>⚡ {result['event']}</div>", unsafe_allow_html=True)
+        else:
+            if result.get("event"):
+                st.markdown(f"<div class='tradeevent'>⚡ {result['event']} · Position CLOSED</div>", unsafe_allow_html=True)
+            st.caption(f"Signal: {sig_action} · Evidence {result['confidence']:.1f}% · {'QUALIFIED' if qualified else 'NOT QUALIFIED'}")
 
 
 def render_app():
@@ -113,12 +146,18 @@ def render_app():
         capital = st.number_input("Paper capital (₹)", 10000.0, 100000000.0, 100000.0, 10000.0)
         risk = st.slider("Risk / trade %", 0.1, 3.0, 1.0, 0.1)
         brokerage = st.number_input("Costs %", 0.0, 0.50, 0.03, 0.01, format="%.2f")
-        st.divider(); st.markdown("### ⚡ Live Engine")
-        auto = st.checkbox("AUTO PAPER TRADING", True, help="When enabled, a qualifying signal opens a paper position. No real-money order is sent.")
+        st.divider(); st.markdown("### ⚡ Trade Mode")
+        trade_mode = st.radio("How should signals be handled?", ["Suggestion Only", "Auto Paper"], index=1, help="Suggestion Only shows BUY/SELL and lets you click a paper order. Auto Paper opens the paper order automatically when the signal passes the gate.")
+        if st.button("Reset paper account", use_container_width=True):
+            reset_paper_account(capital)
+            st.session_state.paper_last_entry_bar = None
+            st.session_state.paper_last_exit_bar = None
+            st.rerun()
         if st.button("↻ Refresh full dashboard", use_container_width=True): st.rerun()
-        if st.button("Reset paper account", use_container_width=True): reset_paper_account(capital); st.rerun()
 
     _init_state(capital)
+    if "paper_last_entry_bar" not in st.session_state:
+        st.session_state.paper_last_entry_bar = None
 
     st.markdown(f"<div class='hero'><div class='brand'>ALGO TRADING PRO</div><div class='sub'>Indian Market Command Center · NIFTY 50 · SENSEX · BANK NIFTY · loaded {_now()}</div></div>", unsafe_allow_html=True)
 
@@ -131,11 +170,6 @@ def render_app():
     qty = position_size(capital, risk, sig.entry, sig.stop) if qualified else 0
     last = float(x.Close.iloc[-1])
 
-    # Initialize state BEFORE any live fragment starts, then let the automatic paper engine act.
-    if auto and qualified:
-        process_latest_bar(x, strategy, risk, brokerage, reward)
-    pos = _position_from_state(st.session_state.get("paper_position"))
-
     st.markdown("<div class='section'>🇮🇳 Indian Market · Live Overview</div>", unsafe_allow_html=True)
     index_snapshot = []
     for index_name, index_symbol in INDEX_UNIVERSE.items():
@@ -143,18 +177,20 @@ def render_app():
         if d is not None and not d.empty:
             index_snapshot.append((index_name, index_symbol, float(d.Close.iloc[-1])))
     if len(index_snapshot) == 3:
-        # Streamlit reruns ONLY this fragment every second. The main page/chart do not rerun.
-        _live_market_fragment(index_snapshot, symbol, last)
+        _live_market_fragment(index_snapshot, symbol, last, strategy, risk, brokerage, reward, threshold, strict, trade_mode)
     else:
         st.error("Live index feed did not return all three indexes. NIFTY 50, SENSEX and BANK NIFTY must all be available before rendering the live cards.")
 
-    st.markdown("<div class='section'>⚡ Automatic Paper Trading</div>", unsafe_allow_html=True)
+    pos = _position_from_state(st.session_state.get("paper_position"))
+    st.markdown("<div class='section'>⚡ Paper Trading</div>", unsafe_allow_html=True)
+    if trade_mode == "Auto Paper":
+        st.caption("AUTO PAPER: qualifying BUY/SELL signals are executed automatically. When live price reaches TARGET, the position is automatically closed with SELL/COVER. STOP and signal-flip exits are also active. No real-money order is sent.")
+    else:
+        st.caption("SUGGESTION ONLY: the model shows BUY/SELL; click the paper-order button in the live block when you want to enter.")
     if pos:
-        st.success(f"PAPER {pos.side} OPEN · Qty {pos.qty:,} · Entry {_money(pos.entry)} · Live Price/P&L updates every second above")
-        p1, p2, p3, p4 = st.columns(4)
-        p1.metric("POSITION", pos.side); p2.metric("QTY", f"{pos.qty:,}"); p3.metric("STOP", _money(pos.stop)); p4.metric("TARGET", _money(pos.target))
+        st.success(f"PAPER {pos.side} OPEN · Qty {pos.qty:,} · Entry {_money(pos.entry)} · Target {_money(pos.target)} · Stop {_money(pos.stop)}")
     elif qualified:
-        st.info(f"{'🟢 BUY' if sig.action == 'BUY' else '🔴 SELL/SHORT'} signal ready · Qty {qty:,} · Entry {_money(sig.entry)} · AUTO PAPER TRADING {'ON' if auto else 'OFF'}")
+        st.info(f"{'🟢 BUY' if sig.action == 'BUY' else '🔴 SELL / SHORT'} suggestion · Qty {qty:,} · Current {_money(last)} · Target {_money(sig.target)} · Stop {_money(sig.stop)}")
     else:
         st.warning(f"NO PAPER ORDER · {sig.action} signal / evidence {sig.confidence:.1f}% / gate {threshold}%")
 
@@ -177,7 +213,7 @@ def render_app():
         st.markdown("#### Signal reasoning")
         for r in sig.reasons[:7]: st.write("• " + r)
 
-    st.caption("Only the live quote/paper P&L fragment reruns every second. The main page and chart stay static. Yahoo data is delayed/throttled and is not a guaranteed exchange tick feed.")
+    st.caption("Only the live quote/paper-trade fragment reruns every second. The main page and chart stay static. Yahoo data can be delayed/throttled and is not a guaranteed exchange tick feed.")
 
     st.markdown("### 🧪 Backtest Lab")
     eq, metrics = backtest(df, strategy, capital, risk, brokerage)
