@@ -6,8 +6,20 @@ const API = import.meta.env.VITE_API_URL || 'https://stock-algo-trading-api.onre
 const STRATEGIES = ['Ensemble', 'EMA Crossover', 'RSI Reversion', 'MACD', 'Trend Momentum', 'Mean Reversion']
 const DEFAULTS = { strategy: 'Ensemble', risk_pct: 1, brokerage_pct: 0.03, reward_r: 2, threshold: 90, strict: true, auto: true, capital: 100000 }
 
-function fmt(x) { const n = Number(x); return Number.isFinite(n) ? n.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) : '—' }
-function fmt0(x) { const n = Number(x); return Number.isFinite(n) ? Math.round(n).toLocaleString('en-IN') : '—' }
+function fmt(x) {
+  const n = Number(x)
+  if (!Number.isFinite(n)) return '—'
+  return n.toLocaleString('en-IN', {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2
+  })
+}
+
+function fmt0(x) {
+  const n = Number(x)
+  return Number.isFinite(n) ? Math.round(n).toLocaleString('en-IN') : '—'
+}
+
 function cls(value) { return String(value || 'hold').toLowerCase().replace(/\s+/g, '-') }
 
 function IndexCard({ data }) {
