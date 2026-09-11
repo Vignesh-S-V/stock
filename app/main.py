@@ -6,8 +6,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import streamlit as st
-
-from app.premium_dashboard import render_app
+from app.live_terminal import render_app
 
 st.set_page_config(
     page_title="Algo Trading Pro",
