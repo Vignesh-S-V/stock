@@ -9,16 +9,19 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from app.live_feed import fetch_live_1m
 from app.ml_model import model_is_ready, predict_ml_signal, prewarm_ml_model
+from app.news import get_news, news_confirmation
 from app.option_chain import build_option_recommendation, fetch_bse_sensex_chain, fetch_nse_chain
 from app.trading import INDEX_UNIVERSE, POPULAR_STOCKS, add_indicators, position_size, score_signal
 
-app = FastAPI(title="Algo Trading Pro API", version="1.3.0")
+app = FastAPI(title="Algo Trading Pro API", version="1.4.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 INDEX_OPTION_SYMBOLS = {"NIFTY 50": "NIFTY", "BANK NIFTY": "BANKNIFTY", "SENSEX": "SENSEX"}
 INDEX_DISPLAY_ORDER = ("NIFTY 50", "BANK NIFTY", "SENSEX")
 _option_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
 _market_cache: dict[str, tuple[float, pd.DataFrame, float]] = {}
+_news_cache: dict[str, tuple[float, dict[str, Any]]] = {}
 MARKET_CACHE_TTL = 5.0
+NEWS_CACHE_TTL = 180.0
 
 @dataclass
 class PaperPosition:
@@ -55,6 +58,11 @@ def option_chain_cached(name: str):
     if cached and now-cached[0]<10: return cached[1]
     chain=fetch_bse_sensex_chain() if name=="SENSEX" else fetch_nse_chain(name); _option_cache[name]=(now,chain); return chain
 
+def news_cached(symbol: str):
+    now=time.time(); cached=_news_cache.get(symbol)
+    if cached and now-cached[0]<NEWS_CACHE_TTL: return cached[1]
+    value=get_news(symbol); _news_cache[symbol]=(now,value); return value
+
 def model_signal(x: pd.DataFrame, symbol: str, strategy: str, threshold: float):
     technical=score_signal(x.iloc[-1],strategy,reward_r=2.0)
     if strategy!="Ensemble": return technical,None
@@ -83,9 +91,12 @@ def index_decision(name: str,ticker: str,threshold: float):
     option=build_option_recommendation(spot,sig.action,sig.target,option_chain_cached(INDEX_OPTION_SYMBOLS[name]))
     return {"name":name,"symbol":ticker,"available":True,"price":spot,"decision":sig.action,"confidence":sig.confidence,"entry":sig.entry,"stop":sig.stop,"target":sig.target,"risk_reward":sig.risk_reward,"reasons":sig.reasons,"model":asdict(ml) if ml else None,"option":option,"timestamp":time.time()}
 
-def execute_paper(account: PaperAccount,x: pd.DataFrame,symbol: str,strategy: str,risk_pct: float,brokerage_pct: float,reward_r: float,threshold: float,strict: bool,auto: bool):
+def execute_paper(account: PaperAccount,x: pd.DataFrame, symbol: str,strategy: str,risk_pct: float,brokerage_pct: float,reward_r: float,threshold: float,strict: bool,auto: bool,news: dict[str, Any]):
     price=float(x.iloc[-1]["Close"]); sig,ml=model_signal(x,symbol,strategy,threshold)
-    qualified=sig.action!="HOLD" and sig.confidence>=threshold if strict else sig.action!="HOLD"; event=""
+    news_ok,news_reason=news_confirmation(sig.action,news)
+    sig.reasons.append(news_reason)
+    qualified=sig.action!="HOLD" and sig.confidence>=threshold and news_ok if strict else sig.action!="HOLD" and news_ok
+    event=""
     if account.position:
         p=account.position; pnl=(price-p.entry)*p.qty if p.side=="LONG" else (p.entry-price)*p.qty; exit_reason=None
         if p.side=="LONG" and price<=p.stop: exit_reason="STOP"
@@ -98,16 +109,18 @@ def execute_paper(account: PaperAccount,x: pd.DataFrame,symbol: str,strategy: st
     if account.position is None and auto and qualified and sig.action in {"BUY","SELL"}:
         qty=position_size(account.cash,risk_pct,price,sig.stop)
         if qty>0:
-            side="LONG" if sig.action=="BUY" else "SHORT"; fee=abs(qty*price)*brokerage_pct/100; account.cash-=fee; account.position=PaperPosition(side,qty,price,sig.stop,sig.target,time.time(),sig.confidence); event=f"PAPER {sig.action} OPEN · Qty {qty:,} · Entry ₹{price:,.2f}"
+            side="LONG" if sig.action=="BUY" else "SHORT"; fee=abs(qty*price)*brokerage_pct/100; account.cash-=fee; account.position=PaperPosition(side,qty,price,sig.stop,sig.target,time.time(),sig.confidence); event=f"PAPER {sig.action} OPEN · Qty {qty:,} · Entry ₹{price:,.2f} · News {news.get('bias','NEUTRAL')}";
     p=account.position; live_pnl=(price-p.entry)*p.qty if p and p.side=="LONG" else ((p.entry-price)*p.qty if p else 0.0)
     return {"price":price,"signal":asdict(sig),"model":asdict(ml) if ml else None,"qualified":qualified,"position":asdict(p) if p else None,"live_pnl":live_pnl,"cash":account.cash,"realized_pnl":account.realized,"event":event,"timestamp":time.time()}
 
 @app.get("/")
-def root(): return {"service":"Algo Trading Pro API","status":"ok","websocket":"/ws","version":"1.3.0"}
+def root(): return {"service":"Algo Trading Pro API","status":"ok","websocket":"/ws","version":"1.4.0"}
 @app.get("/health")
 def health(): return {"status":"ok"}
 @app.get("/universe")
 def universe(): return {"indices":INDEX_UNIVERSE,"stocks":POPULAR_STOCKS}
+@app.get("/news")
+def news(symbol: str = "RELIANCE.NS"): return _json_safe(news_cached(symbol.upper()))
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
@@ -126,13 +139,11 @@ async def websocket_endpoint(ws: WebSocket):
             if x is None or price is None:
                 payload={"type":"error","message":"Live market data unavailable","timestamp":time.time()}
             else:
-                # Never block the first dashboard tick on a multi-fold ML training job.
                 if config["strategy"]=="Ensemble" and not model_is_ready(config["symbol"]):
                     asyncio.create_task(asyncio.to_thread(prewarm_ml_model,x,config["symbol"]))
-                result=await asyncio.to_thread(execute_paper,account,x,config["symbol"],config["strategy"],float(config["risk_pct"]),float(config["brokerage_pct"]),float(config["reward_r"]),float(config["threshold"]),bool(config["strict"]),bool(config["auto"]))
-                result["type"]="tick"; result["symbol"]=config["symbol"]
-                # Send selected-symbol data immediately; index models/options are allowed to follow.
-                result["indices"]={}; await ws.send_json(_json_safe(result))
+                news_data=await asyncio.to_thread(news_cached,config["symbol"])
+                result=await asyncio.to_thread(execute_paper,account,x,config["symbol"],config["strategy"],float(config["risk_pct"]),float(config["brokerage_pct"]),float(config["reward_r"]),float(config["threshold"]),bool(config["strict"]),bool(config["auto"]),news_data)
+                result["type"]="tick"; result["symbol"]=config["symbol"]; result["news"]=news_data; result["indices"]={}; await ws.send_json(_json_safe(result))
                 jobs=[]
                 for name in INDEX_DISPLAY_ORDER: jobs.append(asyncio.to_thread(index_decision,name,INDEX_UNIVERSE[name],float(config["threshold"])))
                 index_results=await asyncio.gather(*jobs)
