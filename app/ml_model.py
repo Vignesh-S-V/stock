@@ -7,9 +7,13 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import requests
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier, VotingClassifier
+from sklearn.metrics import balanced_accuracy_score
 from sklearn.model_selection import TimeSeriesSplit
+
+from app.trading import add_indicators
 
 FEATURES = [
     "RSI_14", "MACD", "MACD_HIST", "ATR_PCT", "BB_WIDTH", "VWAP_DIST",
@@ -18,7 +22,8 @@ FEATURES = [
 ]
 MODEL_TTL_SECONDS = 600
 MODEL_THRESHOLD_DEFAULT = 95.0
-MODEL_MIN_SAMPLES = 350
+MODEL_MIN_SAMPLES = 700
+TRAIN_PERIOD_SECONDS = 60 * 86400
 _MODEL_CACHE: dict[str, tuple[float, Any, dict[str, Any]]] = {}
 _MODEL_LOCK = threading.Lock()
 
@@ -50,11 +55,9 @@ def _prepare_features(df: pd.DataFrame) -> pd.DataFrame:
 def _training_set(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     x = _prepare_features(df)
     close = pd.to_numeric(x["Close"], errors="coerce")
-    # Predict a meaningful 5-minute move, scaled to the instrument's recent
-    # volatility. This avoids labelling every tiny market fluctuation as a trade.
-    future_return = close.shift(-5) / close - 1.0
+    future_return = close.shift(-3) / close - 1.0
     volatility = close.pct_change().rolling(30).std()
-    adaptive = (volatility * 5.0 * 0.80).clip(lower=0.0008, upper=0.004)
+    adaptive = (volatility * 3.0 * 0.75).clip(lower=0.0006, upper=0.0035)
     y = pd.Series(np.nan, index=x.index, dtype=float)
     y.loc[future_return > adaptive] = 1.0
     y.loc[future_return < -adaptive] = 0.0
@@ -63,8 +66,55 @@ def _training_set(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     return data.loc[mask], y.loc[mask].astype(int)
 
 
+def _fetch_training_frame(symbol: str) -> pd.DataFrame:
+    """Fetch up to 60 days of 5-minute data for a broader training sample.
+
+    Yahoo/yfinance supports intraday history only within a rolling 60-day window;
+    5-minute bars provide materially more samples than the live 1-minute snapshot.
+    """
+    now = int(time.time())
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {
+        "period1": now - TRAIN_PERIOD_SECONDS,
+        "period2": now + 5,
+        "interval": "5m",
+        "includePrePost": "true",
+        "events": "div,splits",
+        "_": str(now),
+    }
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            headers={"Cache-Control": "no-cache", "Pragma": "no-cache", "User-Agent": "Mozilla/5.0"},
+            timeout=12,
+        )
+        response.raise_for_status()
+        result = (response.json().get("chart", {}).get("result") or [None])[0]
+        if not result:
+            return pd.DataFrame()
+        timestamps = result.get("timestamp", [])
+        quote = (result.get("indicators", {}).get("quote") or [{}])[0]
+        if not timestamps:
+            return pd.DataFrame()
+        frame = pd.DataFrame(
+            {
+                "Open": quote.get("open", []),
+                "High": quote.get("high", []),
+                "Low": quote.get("low", []),
+                "Close": quote.get("close", []),
+                "Volume": quote.get("volume", []),
+            },
+            index=pd.to_datetime(timestamps, unit="s", utc=True).tz_convert(None),
+        )
+        frame = frame.dropna(subset=["Open", "High", "Low", "Close"])
+        return frame.loc[~frame.index.duplicated(keep="last")].sort_index()
+    except Exception:
+        return pd.DataFrame()
+
+
 def _calibrated_model(base: Any, X: pd.DataFrame, y: pd.Series):
-    splitter = TimeSeriesSplit(n_splits=3)
+    splitter = TimeSeriesSplit(n_splits=4)
     for train_idx, test_idx in splitter.split(X):
         if y.iloc[train_idx].nunique() < 2 or y.iloc[test_idx].nunique() < 2:
             return None
@@ -73,8 +123,15 @@ def _calibrated_model(base: Any, X: pd.DataFrame, y: pd.Series):
     return model
 
 
-def _fit(df: pd.DataFrame) -> tuple[Any | None, dict[str, Any]]:
-    X, y = _training_set(df)
+def _fit(df: pd.DataFrame, symbol: str) -> tuple[Any | None, dict[str, Any]]:
+    training = _fetch_training_frame(symbol)
+    if len(training) < 1000:
+        training = df.copy()
+    if training.empty:
+        return None, {"samples": 0, "validation_accuracy": None}
+
+    training = add_indicators(training)
+    X, y = _training_set(training)
     if len(X) < MODEL_MIN_SAMPLES or y.nunique() < 2:
         return None, {"samples": int(len(X)), "validation_accuracy": None}
 
@@ -85,21 +142,22 @@ def _fit(df: pd.DataFrame) -> tuple[Any | None, dict[str, Any]]:
         return None, {"samples": int(len(X)), "validation_accuracy": None}
 
     rf = RandomForestClassifier(
-        n_estimators=240, max_depth=10, min_samples_leaf=5,
+        n_estimators=300, max_depth=10, min_samples_leaf=6,
         class_weight="balanced_subsample", random_state=42, n_jobs=1,
     )
     hgb = HistGradientBoostingClassifier(
-        max_iter=180, learning_rate=0.04, max_leaf_nodes=15,
-        l2_regularization=0.5, random_state=42,
+        max_iter=220, learning_rate=0.035, max_leaf_nodes=15,
+        l2_regularization=1.0, random_state=42,
     )
     base = VotingClassifier(
-        estimators=[("rf", rf), ("hgb", hgb)], voting="soft", weights=[1.0, 1.2], n_jobs=1
+        estimators=[("rf", rf), ("hgb", hgb)], voting="soft", weights=[1.0, 1.3], n_jobs=1
     )
     try:
         validation_model = _calibrated_model(base, X_train, y_train)
         if validation_model is None:
             return None, {"samples": int(len(X)), "validation_accuracy": None}
-        validation_accuracy = float((validation_model.predict(X_test) == y_test).mean())
+        predictions = validation_model.predict(X_test)
+        validation_accuracy = float(balanced_accuracy_score(y_test, predictions))
         final_model = _calibrated_model(base, X, y)
         if final_model is None:
             return None, {"samples": int(len(X)), "validation_accuracy": validation_accuracy}
@@ -109,8 +167,17 @@ def _fit(df: pd.DataFrame) -> tuple[Any | None, dict[str, Any]]:
     return final_model, {"samples": int(len(X)), "validation_accuracy": validation_accuracy}
 
 
+def _prediction_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert live 1-minute bars to the same 5-minute feature timeframe used in training."""
+    x = df.copy()
+    if len(x) >= 30:
+        x = x.resample("5min").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna(subset=["Open", "High", "Low", "Close"])
+        x = add_indicators(x)
+    return x
+
+
 def predict_ml_signal(df: pd.DataFrame, symbol: str, threshold: float = MODEL_THRESHOLD_DEFAULT) -> MLSignal:
-    """Return a calibrated probability; never inflate confidence to hit 95%."""
+    """Return a genuinely calibrated probability; never inflate confidence to hit 95%."""
     threshold = min(100.0, max(50.0, float(threshold)))
     now = time.time()
     with _MODEL_LOCK:
@@ -118,13 +185,16 @@ def predict_ml_signal(df: pd.DataFrame, symbol: str, threshold: float = MODEL_TH
         if cached and now - cached[0] < MODEL_TTL_SECONDS:
             model, meta = cached[1], cached[2]
         else:
-            model, meta = _fit(df)
+            model, meta = _fit(df, symbol)
             _MODEL_CACHE[symbol] = (now, model, meta)
 
     if model is None:
         return MLSignal("HOLD", 0.0, False, int(meta.get("samples", 0)), meta.get("validation_accuracy"), threshold, "Model did not meet minimum data/calibration requirements.")
 
-    latest = _prepare_features(df).iloc[[-1]][FEATURES]
+    prediction_df = _prediction_frame(df)
+    if prediction_df.empty:
+        return MLSignal("HOLD", 0.0, True, int(meta["samples"]), meta.get("validation_accuracy"), threshold, "Live prediction timeframe is incomplete.")
+    latest = _prepare_features(prediction_df).iloc[[-1]][FEATURES]
     if latest.isna().any(axis=None):
         return MLSignal("HOLD", 0.0, True, int(meta["samples"]), meta.get("validation_accuracy"), threshold, "Latest feature row is incomplete.")
 
