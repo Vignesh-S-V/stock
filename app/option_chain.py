@@ -43,37 +43,18 @@ def _session() -> requests.Session:
 
 
 def fetch_dhan_chain(name: str) -> dict[str, Any] | None:
-    """Use Dhan's authenticated option-chain API when configured.
-
-    This is the preferred production path because it provides authorized real-time
-    OI, Greeks, volume, LTP and bid/ask without scraping exchange web pages.
-    """
+    """Use Dhan's authenticated option-chain API when configured."""
     token, client_id = os.getenv("DHAN_ACCESS_TOKEN"), os.getenv("DHAN_CLIENT_ID")
     security_id = DHAN_INDEX_IDS.get(name)
-    if not token or not client_id or security_id is None:
-        return None
+    if not token or not client_id or security_id is None: return None
     headers = {"Content-Type": "application/json", "access-token": token, "client-id": client_id}
     try:
-        expiry_resp = requests.post(
-            "https://api.dhan.co/v2/optionchain/expirylist",
-            headers=headers,
-            json={"UnderlyingScrip": security_id, "UnderlyingSeg": "IDX_I"},
-            timeout=8,
-        )
-        expiry_resp.raise_for_status()
-        expiry_data = expiry_resp.json().get("data") or []
+        expiry_resp = requests.post("https://api.dhan.co/v2/optionchain/expirylist", headers=headers, json={"UnderlyingScrip": security_id, "UnderlyingSeg": "IDX_I"}, timeout=8)
+        expiry_resp.raise_for_status(); expiry_data = expiry_resp.json().get("data") or []
         if not expiry_data: return None
         expiry = expiry_data[0]
-        chain_resp = requests.post(
-            "https://api.dhan.co/v2/optionchain",
-            headers=headers,
-            json={"UnderlyingScrip": security_id, "UnderlyingSeg": "IDX_I", "Expiry": expiry},
-            timeout=10,
-        )
-        chain_resp.raise_for_status()
-        payload = chain_resp.json()
-        data = payload.get("data") or {}
-        oc = data.get("oc") or {}
+        chain_resp = requests.post("https://api.dhan.co/v2/optionchain", headers=headers, json={"UnderlyingScrip": security_id, "UnderlyingSeg": "IDX_I", "Expiry": expiry}, timeout=10)
+        chain_resp.raise_for_status(); data = (chain_resp.json().get("data") or {}); oc = data.get("oc") or {}
         rows: list[dict[str, Any]] = []
         for strike_text, legs in oc.items():
             strike = _num(strike_text)
@@ -81,23 +62,18 @@ def fetch_dhan_chain(name: str) -> dict[str, Any] | None:
             item: dict[str, Any] = {"strike": strike, "expiry": expiry}
             for side in ("ce", "pe"):
                 leg = legs.get(side) or {}
-                item[side.upper()] = {
-                    "ltp": _num(leg.get("last_price")),
-                    "bid": _num(leg.get("top_bid_price")),
-                    "ask": _num(leg.get("top_ask_price")),
-                    "iv": _num(leg.get("implied_volatility")),
-                    "oi": _num(leg.get("oi")),
-                    "volume": _num(leg.get("volume")),
-                    "security_id": leg.get("security_id"),
-                }
+                item[side.upper()] = {"ltp": _num(leg.get("last_price")), "bid": _num(leg.get("top_bid_price")), "ask": _num(leg.get("top_ask_price")), "iv": _num(leg.get("implied_volatility")), "oi": _num(leg.get("oi")), "volume": _num(leg.get("volume")), "security_id": leg.get("security_id")}
             rows.append(item)
         return {"source": "Dhan", "symbol": name, "expiry": expiry, "rows": rows} if rows else None
-    except (requests.RequestException, ValueError, TypeError):
-        return None
+    except (requests.RequestException, ValueError, TypeError): return None
 
 
 def fetch_nse_chain(symbol: str) -> dict[str, Any] | None:
-    """Best-effort public fallback; production should use an authorized provider."""
+    """Prefer authorized Dhan data; public NSE is only a best-effort fallback."""
+    dhan_name = {"NIFTY": "NIFTY 50", "BANKNIFTY": "BANK NIFTY"}.get(symbol)
+    if dhan_name:
+        dhan = fetch_dhan_chain(dhan_name)
+        if dhan: return dhan
     try:
         s = _session(); url = "https://www.nseindia.com/api/option-chain-indices"; payload = None
         for _ in range(2):
@@ -122,7 +98,9 @@ def fetch_nse_chain(symbol: str) -> dict[str, Any] | None:
 
 
 def fetch_bse_sensex_chain() -> dict[str, Any] | None:
-    """Best-effort BSE SENSEX market-watch fallback."""
+    """Prefer authorized Dhan SENSEX data; BSE page is a fallback."""
+    dhan = fetch_dhan_chain("SENSEX")
+    if dhan: return dhan
     try:
         r = requests.get("https://m.bseindia.com/derivatives.aspx", headers=BSE_HEADERS, timeout=8); r.raise_for_status()
         tables = pd.read_html(io.StringIO(r.text)); rows: list[dict[str, Any]] = []
@@ -131,8 +109,7 @@ def fetch_bse_sensex_chain() -> dict[str, Any] | None:
             if table.shape[1] < 2: continue
             headers = " ".join(str(c) for c in table.columns)
             if "Series Code" not in headers or "LTP" not in headers: continue
-            code_col = next((c for c in table.columns if "Series Code" in str(c)), table.columns[0])
-            ltp_col = next((c for c in table.columns if str(c).strip() == "LTP"), table.columns[1])
+            code_col = next((c for c in table.columns if "Series Code" in str(c)), table.columns[0]); ltp_col = next((c for c in table.columns if str(c).strip() == "LTP"), table.columns[1])
             for _, row in table.iterrows():
                 code = str(row.get(code_col, "")).strip(); match = pattern.match(code)
                 if not match: continue
