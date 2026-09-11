@@ -14,10 +14,11 @@ from app.live_feed import fetch_live_1m
 from app.option_chain import build_option_recommendation, fetch_bse_sensex_chain, fetch_nse_chain
 from app.trading import INDEX_UNIVERSE, POPULAR_STOCKS, add_indicators, position_size, score_signal
 
-app = FastAPI(title="Algo Trading Pro API", version="1.1.1")
+app = FastAPI(title="Algo Trading Pro API", version="1.1.2")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 INDEX_OPTION_SYMBOLS = {"NIFTY 50": "NIFTY", "BANK NIFTY": "BANKNIFTY", "SENSEX": "SENSEX"}
+INDEX_DISPLAY_ORDER = ("NIFTY 50", "BANK NIFTY", "SENSEX")
 _option_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
 
 
@@ -59,7 +60,6 @@ def account_for(client_id: str, capital: float = 100000.0) -> PaperAccount:
 
 
 def _json_safe(value: Any) -> Any:
-    """Convert pandas/numpy/non-finite values to strict JSON-safe values."""
     if isinstance(value, dict):
         return {str(k): _json_safe(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -86,10 +86,7 @@ def option_chain_cached(name: str) -> dict[str, Any] | None:
     cached = _option_cache.get(name)
     if cached and now - cached[0] < 10:
         return cached[1]
-    if name == "SENSEX":
-        chain = fetch_bse_sensex_chain()
-    else:
-        chain = fetch_nse_chain(name)
+    chain = fetch_bse_sensex_chain() if name == "SENSEX" else fetch_nse_chain(name)
     _option_cache[name] = (now, chain)
     return chain
 
@@ -190,13 +187,13 @@ async def websocket_endpoint(ws: WebSocket) -> None:
             else:
                 result = await asyncio.to_thread(execute_paper, account, x, config["strategy"], float(config["risk_pct"]), float(config["brokerage_pct"]), float(config["reward_r"]), float(config["threshold"]), bool(config["strict"]), bool(config["auto"]))
                 indices: dict[str, Any] = {}
-                for name, ticker in INDEX_UNIVERSE.items():
-                    indices[name] = await asyncio.to_thread(index_decision, name, ticker)
+                # Keep the UI order deterministic regardless of INDEX_UNIVERSE dict ordering.
+                for name in INDEX_DISPLAY_ORDER:
+                    indices[name] = await asyncio.to_thread(index_decision, name, INDEX_UNIVERSE[name])
                 result["type"] = "tick"
                 result["symbol"] = config["symbol"]
                 result["indices"] = indices
                 payload = result
-            # Browser JSON.parse rejects NaN/Infinity even though Python's JSON encoder permits them.
             await ws.send_json(_json_safe(payload))
             await asyncio.sleep(1.0)
     except (WebSocketDisconnect, RuntimeError):
