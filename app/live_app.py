@@ -1,8 +1,12 @@
 from __future__ import annotations
+
 from datetime import datetime, timezone
+
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+
+from app.live_feed import fetch_live_1m
 from app.live_price import render_live_price, render_market_overview, render_paper_live
 from app.paper_engine import _money, _position_from_state, process_latest_bar, reset_paper_account
 from app.trading import INDEX_UNIVERSE, PERIODS, POPULAR_STOCKS, add_indicators, backtest, position_size, regime_label, score_signal
@@ -26,17 +30,19 @@ def _chart(x,sig,pos=None):
     for c in ["EMA_9","EMA_21","EMA_50","VWAP"]:
         if c in y: fig.add_trace(go.Scatter(x=y.index,y=y[c],mode="lines",name=c.replace("_"," ")))
     if sig.action!="HOLD":
-        for val,text,dash in [(sig.entry,"ENTRY","dot"),(sig.stop,"STOP","dash"),(sig.target,"TARGET","dash")]: fig.add_hline(y=val,line_dash=dash,annotation_text=f"{text} {_money(val)}")
+        for val,text,dash in [(sig.entry,"ENTRY", "dot"),(sig.stop,"STOP","dash"),(sig.target,"TARGET","dash")]: fig.add_hline(y=val,line_dash=dash,annotation_text=f"{text} {_money(val)}")
     if pos:
         for val,text in [(pos.entry,f"OPEN {pos.side}"),(pos.stop,"LIVE STOP"),(pos.target,"LIVE TARGET")]: fig.add_hline(y=val,line_dash="dot" if text.startswith("OPEN") else "dash",annotation_text=f"{text} {_money(val)}")
     fig.update_layout(height=500,template="plotly_dark",paper_bgcolor="#080b10",plot_bgcolor="#080b10",margin=dict(l=8,r=8,t=25,b=8),xaxis_rangeslider_visible=False,hovermode="x unified",legend=dict(orientation="h",y=1.02,x=0))
     return fig
 
 def _index_snapshot():
+    """Use the uncached direct Yahoo feed so the front page gets index values reliably."""
     out=[]
     for name,symbol in INDEX_UNIVERSE.items():
-        d=_data(symbol,"5d","1m")
-        if d is not None and not d.empty: out.append((name,symbol,float(d.Close.iloc[-1])))
+        d=fetch_live_1m(symbol,"1d")
+        if d is not None and not d.empty:
+            out.append((name,symbol,float(d.Close.iloc[-1])))
     return out
 
 def render_app():
@@ -59,12 +65,12 @@ def render_app():
     st.markdown("<div class='section'>🇮🇳 Indian Market · Live Overview</div>",unsafe_allow_html=True)
     indexes=_index_snapshot()
     if indexes: render_market_overview(indexes)
-    else: st.warning("Index feed unavailable right now.")
-    st.caption("Only these price cards poll every second in the browser. The full Streamlit screen and chart do not refresh every second.")
+    else: st.warning("Index feed unavailable right now. Click Refresh full dashboard and retry.")
+    st.caption("NIFTY 50, SENSEX and BANK NIFTY cards stay visible; only their price/mini-graph DOM updates every second. Full screen and chart do not refresh.")
 
     df=_data(symbol,period,interval)
     if df is None or df.empty: st.error(f"No market data for {symbol}. Try 1d + 1mo."); return
-    x=add_indicators(df); sig=score_signal(x.iloc[-1],strategy,reward_r=reward); qualified=sig.action!="HOLD" and sig.confidence>=threshold if strict else sig.action!="HOLD"; qty=position_size(capital,risk,sig.entry,sig.stop) if qualified else 0; last=float(x.Close.iloc[-1])
+    x=add_indicators(df); sig=score_signal(x.iloc[-1],strategy,reward_r=reward); qualified=sig.action!="HOLD" and sig.confidence>=threshold if strict else sig.action!="HOLD"; qty=position_size(capital,risk,sig.entry,sig.stop) if qualified else 0; last=float(x.Close.iloc[-1]); prev=float(x.Close.iloc[-2]) if len(x)>1 else last
     if auto and qualified: process_latest_bar(x,strategy,risk,brokerage,reward)
     pos=_position_from_state(st.session_state.get("paper_position"))
 
