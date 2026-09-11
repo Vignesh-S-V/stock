@@ -19,12 +19,29 @@ function App(){
     <label>Strategy<select value={cfg.strategy} onChange={e=>change('strategy',e.target.value)}>{['Ensemble','Trend Momentum','EMA Crossover','RSI Reversion','MACD','Mean Reversion'].map(x=><option key={x}>{x}</option>)}</select></label>
     <label>Mode<select value={cfg.auto?'auto':'suggest'} onChange={e=>change('auto',e.target.value==='auto')}><option value="auto">Auto Paper</option><option value="suggest">Suggestion Only</option></select></label>
     <label>Gate<input type="number" min="50" max="95" value={cfg.threshold} onChange={e=>change('threshold',+e.target.value)}/></label></section>
-    <section className="indices">{Object.entries(data?.indices||{}).map(([n,v])=><article key={n}><small>{n}</small><strong>₹{v.price.toLocaleString('en-IN',{maximumFractionDigits:2})}</strong><em>LIVE</em></article>)}</section>
-    <section className="grid"><article className="signal"><small>MODEL DECISION</small><div className={'action '+(sig?.action||'HOLD').toLowerCase()}>{sig?.action||'WAIT'}</div><p>Evidence <b>{sig?.confidence??'—'}%</b> · R:R 1:{cfg.reward_r}</p><div className="levels"><span>ENTRY ₹{fmt(sig?.entry)}</span><span>STOP ₹{fmt(sig?.stop)}</span><span>TARGET ₹{fmt(sig?.target)}</span></div></article>
+
+    <section className="indices">{Object.entries(data?.indices||{}).map(([n,v])=><IndexCard key={n} data={v}/>)}</section>
+
+    <section className="grid"><article className="signal"><small>SELECTED STOCK MODEL</small><div className={'action '+(sig?.action||'HOLD').toLowerCase()}>{sig?.action||'WAIT'}</div><p>Evidence <b>{sig?.confidence??'—'}%</b> · R:R 1:{cfg.reward_r}</p><div className="levels"><span>ENTRY ₹{fmt(sig?.entry)}</span><span>STOP ₹{fmt(sig?.stop)}</span><span>TARGET ₹{fmt(sig?.target)}</span></div></article>
     <article className="paper"><small>PAPER TRADING</small>{pos?<><h2>{pos.side} OPEN</h2><p>Qty <b>{pos.qty.toLocaleString()}</b> · Entry ₹{fmt(pos.entry)}</p><div className="levels"><span>STOP ₹{fmt(pos.stop)}</span><span>TARGET ₹{fmt(pos.target)}</span></div><div className="pnl">LIVE P/L {data.live_pnl>=0?'+':''}₹{fmt(data.live_pnl)}</div></>:<h2>NO OPEN POSITION</h2>}<p>{data?.event||'Waiting for a qualifying signal.'}</p></article></section>
-    <section className="reasons"><h2>Signal reasoning</h2>{(sig?.reasons||[]).slice(0,7).map((r,i)=><div key={i}>• {r}</div>)}</section>
-    <footer>Last server update: {data?new Date(data.timestamp*1000).toLocaleTimeString():'—'} · Yahoo 1-minute snapshot fallback; no real-money order is sent.</footer>
+    <section className="reasons"><h2>Stock signal reasoning</h2>{(sig?.reasons||[]).slice(0,7).map((r,i)=><div key={i}>• {r}</div>)}</section>
+    <footer>Last server update: {data?new Date(data.timestamp*1000).toLocaleTimeString():'—'} · Yahoo 1-minute snapshots + exchange option-chain LTP · paper trading only.</footer>
   </main>
 }
-function fmt(x){return Number.isFinite(+x)?(+x).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2}):'—'}
+
+function IndexCard({data}){
+  const o=data?.option; const decision=data?.decision||'HOLD';
+  return <article className="index-card">
+    <div className="index-head"><div><small>{data?.name}</small><strong>₹{fmt(data?.price)}</strong></div><span className={'decision '+decision.toLowerCase()}>{decision}</span></div>
+    <div className="index-meta"><span>MODEL {data?.confidence ?? '—'}%</span><span>TARGET ₹{fmt(data?.target)}</span></div>
+    {o?.available ? <div className="option-box">
+      <div className="option-title"><b>{o.contract}</b><span>{o.expiry}</span></div>
+      <div className="option-grid"><div><small>PREMIUM</small><b>₹{fmt(o.premium)}</b></div><div><small>BUY</small><b>₹{fmt(o.buy_price)}</b></div><div><small>SELL / TARGET</small><b>₹{fmt(o.target_price)}</b></div><div><small>STOP</small><b>₹{fmt(o.stop_price)}</b></div></div>
+      <div className="option-foot"><span>IV {fmt(o.iv)}%</span><span>OI {fmtInt(o.oi)}</span><span>VOL {fmtInt(o.volume)}</span><span>{o.source}</span></div>
+    </div> : <div className="option-unavailable">{decision==='HOLD'?'No option trade — model is HOLD.':(o?.reason||'Live option premium unavailable.')}</div>}
+  </article>
+}
+
+function fmt(x){return Number.isFinite(+x)?(+x).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2):'—'}
+function fmtInt(x){return Number.isFinite(+x)?Math.round(+x).toLocaleString('en-IN'):'—'}
 createRoot(document.getElementById('root')).render(<App/>);
