@@ -67,11 +67,7 @@ def _training_set(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
 
 
 def _fetch_training_frame(symbol: str) -> pd.DataFrame:
-    """Fetch up to 60 days of 5-minute data for a broader training sample.
-
-    Yahoo/yfinance supports intraday history only within a rolling 60-day window;
-    5-minute bars provide materially more samples than the live 1-minute snapshot.
-    """
+    """Fetch up to 60 days of 5-minute data for a broader training sample."""
     now = int(time.time())
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     params = {
@@ -114,7 +110,7 @@ def _fetch_training_frame(symbol: str) -> pd.DataFrame:
 
 
 def _calibrated_model(base: Any, X: pd.DataFrame, y: pd.Series):
-    splitter = TimeSeriesSplit(n_splits=4)
+    splitter = TimeSeriesSplit(n_splits=3)
     for train_idx, test_idx in splitter.split(X):
         if y.iloc[train_idx].nunique() < 2 or y.iloc[test_idx].nunique() < 2:
             return None
@@ -142,11 +138,11 @@ def _fit(df: pd.DataFrame, symbol: str) -> tuple[Any | None, dict[str, Any]]:
         return None, {"samples": int(len(X)), "validation_accuracy": None}
 
     rf = RandomForestClassifier(
-        n_estimators=300, max_depth=10, min_samples_leaf=6,
+        n_estimators=140, max_depth=10, min_samples_leaf=6,
         class_weight="balanced_subsample", random_state=42, n_jobs=1,
     )
     hgb = HistGradientBoostingClassifier(
-        max_iter=220, learning_rate=0.035, max_leaf_nodes=15,
+        max_iter=140, learning_rate=0.035, max_leaf_nodes=15,
         l2_regularization=1.0, random_state=42,
     )
     base = VotingClassifier(
