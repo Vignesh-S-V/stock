@@ -28,7 +28,6 @@ _MODEL_CACHE: dict[str, tuple[float, Any, dict[str, Any]]] = {}
 _MODEL_LOCK = threading.Lock()
 _TRAINING_SYMBOLS: set[str] = set()
 
-
 @dataclass
 class MLSignal:
     action: str
@@ -38,7 +37,6 @@ class MLSignal:
     validation_accuracy: float | None
     threshold: float
     reason: str
-
 
 def _prepare_features(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy()
@@ -53,7 +51,6 @@ def _prepare_features(df: pd.DataFrame) -> pd.DataFrame:
     x["VOLUME_RATIO"] = volume / volume_sma.replace(0, np.nan)
     return x.replace([np.inf, -np.inf], np.nan)
 
-
 def _training_set(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     x = _prepare_features(df)
     close = pd.to_numeric(x["Close"], errors="coerce")
@@ -67,7 +64,6 @@ def _training_set(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     mask = data.notna().all(axis=1) & y.notna()
     return data.loc[mask], y.loc[mask].astype(int)
 
-
 def _fetch_training_frame(symbol: str) -> pd.DataFrame:
     now = int(time.time())
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
@@ -76,12 +72,10 @@ def _fetch_training_frame(symbol: str) -> pd.DataFrame:
         response = requests.get(url, params=params, headers={"Cache-Control": "no-cache", "Pragma": "no-cache", "User-Agent": "Mozilla/5.0"}, timeout=12)
         response.raise_for_status()
         result = (response.json().get("chart", {}).get("result") or [None])[0]
-        if not result:
-            return pd.DataFrame()
+        if not result: return pd.DataFrame()
         timestamps = result.get("timestamp", [])
         quote = (result.get("indicators", {}).get("quote") or [{}])[0]
-        if not timestamps:
-            return pd.DataFrame()
+        if not timestamps: return pd.DataFrame()
         frame = pd.DataFrame({"Open": quote.get("open", []), "High": quote.get("high", []), "Low": quote.get("low", []), "Close": quote.get("close", []), "Volume": quote.get("volume", [])}, index=pd.to_datetime(timestamps, unit="s", utc=True).tz_convert(None))
         frame = frame.dropna(subset=["Open", "High", "Low", "Close"])
         frame["Volume"] = pd.to_numeric(frame["Volume"], errors="coerce").fillna(0.0)
@@ -89,53 +83,42 @@ def _fetch_training_frame(symbol: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-
 def _calibrated_model(base: Any, X: pd.DataFrame, y: pd.Series):
     splitter = TimeSeriesSplit(n_splits=3)
     for train_idx, test_idx in splitter.split(X):
-        if y.iloc[train_idx].nunique() < 2 or y.iloc[test_idx].nunique() < 2:
-            return None
+        if y.iloc[train_idx].nunique() < 2 or y.iloc[test_idx].nunique() < 2: return None
     model = CalibratedClassifierCV(estimator=base, method="sigmoid", cv=splitter, ensemble=True)
     model.fit(X, y)
     return model
 
-
 def _fit(df: pd.DataFrame, symbol: str) -> tuple[Any | None, dict[str, Any]]:
     training = _fetch_training_frame(symbol)
-    if len(training) < 1000:
-        training = df.copy()
-    if training.empty:
-        return None, {"samples": 0, "validation_accuracy": None}
+    if len(training) < 1000: training = df.copy()
+    if training.empty: return None, {"samples": 0, "validation_accuracy": None}
     training = add_indicators(training)
     X, y = _training_set(training)
-    if len(X) < MODEL_MIN_SAMPLES or y.nunique() < 2:
-        return None, {"samples": int(len(X)), "validation_accuracy": None}
+    if len(X) < MODEL_MIN_SAMPLES or y.nunique() < 2: return None, {"samples": int(len(X)), "validation_accuracy": None}
     split = int(len(X) * 0.80)
     X_train, X_test = X.iloc[:split], X.iloc[split:]
     y_train, y_test = y.iloc[:split], y.iloc[split:]
-    if y_train.nunique() < 2 or y_test.nunique() < 2:
-        return None, {"samples": int(len(X)), "validation_accuracy": None}
+    if y_train.nunique() < 2 or y_test.nunique() < 2: return None, {"samples": int(len(X)), "validation_accuracy": None}
     rf = RandomForestClassifier(n_estimators=140, max_depth=10, min_samples_leaf=6, class_weight="balanced_subsample", random_state=42, n_jobs=1)
     hgb = HistGradientBoostingClassifier(max_iter=140, learning_rate=0.035, max_leaf_nodes=15, l2_regularization=1.0, random_state=42)
     base = VotingClassifier(estimators=[("rf", rf), ("hgb", hgb)], voting="soft", weights=[1.0, 1.3], n_jobs=1)
     try:
         validation_model = _calibrated_model(base, X_train, y_train)
-        if validation_model is None:
-            return None, {"samples": int(len(X)), "validation_accuracy": None}
+        if validation_model is None: return None, {"samples": int(len(X)), "validation_accuracy": None}
         predictions = validation_model.predict(X_test)
         validation_accuracy = float(balanced_accuracy_score(y_test, predictions))
         final_model = _calibrated_model(base, X, y)
-        if final_model is None:
-            return None, {"samples": int(len(X)), "validation_accuracy": validation_accuracy}
+        if final_model is None: return None, {"samples": int(len(X)), "validation_accuracy": validation_accuracy}
     except (ValueError, RuntimeError, TypeError):
         return None, {"samples": int(len(X)), "validation_accuracy": None}
     return final_model, {"samples": int(len(X)), "validation_accuracy": validation_accuracy}
 
-
 def _prediction_frame(df: pd.DataFrame) -> pd.DataFrame:
     x = df[["Open", "High", "Low", "Close", "Volume"]].copy()
-    for column in ["Open", "High", "Low", "Close", "Volume"]:
-        x[column] = pd.to_numeric(x[column], errors="coerce")
+    for column in ["Open", "High", "Low", "Close", "Volume"]: x[column] = pd.to_numeric(x[column], errors="coerce")
     x["Volume"] = x["Volume"].fillna(0.0)
     x = x.dropna(subset=["Open", "High", "Low", "Close"])
     if len(x) >= 30:
@@ -144,25 +127,23 @@ def _prediction_frame(df: pd.DataFrame) -> pd.DataFrame:
         x = add_indicators(x)
     return x
 
-
 def model_is_ready(symbol: str) -> bool:
     now = time.time()
     with _MODEL_LOCK:
         cached = _MODEL_CACHE.get(symbol)
         return bool(cached and cached[1] is not None and now - cached[0] < MODEL_TTL_SECONDS)
 
-
 def prewarm_ml_model(df: pd.DataFrame, symbol: str) -> None:
+    now = time.time()
     with _MODEL_LOCK:
-        if model_is_ready(symbol) or symbol in _TRAINING_SYMBOLS:
-            return
+        cached = _MODEL_CACHE.get(symbol)
+        if cached and cached[1] is not None and now - cached[0] < MODEL_TTL_SECONDS: return
+        if symbol in _TRAINING_SYMBOLS: return
         _TRAINING_SYMBOLS.add(symbol)
     try:
         predict_ml_signal(df, symbol, train_if_missing=True)
     finally:
-        with _MODEL_LOCK:
-            _TRAINING_SYMBOLS.discard(symbol)
-
+        with _MODEL_LOCK: _TRAINING_SYMBOLS.discard(symbol)
 
 def predict_ml_signal(df: pd.DataFrame, symbol: str, threshold: float = MODEL_THRESHOLD_DEFAULT, train_if_missing: bool = True) -> MLSignal:
     threshold = min(100.0, max(50.0, float(threshold)))
@@ -179,8 +160,7 @@ def predict_ml_signal(df: pd.DataFrame, symbol: str, threshold: float = MODEL_TH
     if model is None:
         return MLSignal("HOLD", 0.0, False, int(meta.get("samples", 0)), meta.get("validation_accuracy"), threshold, "Model did not meet minimum data/calibration requirements.")
     prediction_df = _prediction_frame(df)
-    if prediction_df.empty:
-        return MLSignal("HOLD", 0.0, True, int(meta["samples"]), meta.get("validation_accuracy"), threshold, "Live prediction timeframe is incomplete.")
+    if prediction_df.empty: return MLSignal("HOLD", 0.0, True, int(meta["samples"]), meta.get("validation_accuracy"), threshold, "Live prediction timeframe is incomplete.")
     features = _prepare_features(prediction_df)[FEATURES]
     complete = features.dropna(how="any")
     if complete.empty:
@@ -197,14 +177,10 @@ def predict_ml_signal(df: pd.DataFrame, symbol: str, threshold: float = MODEL_TH
     best = max(p_up, p_down)
     confidence = round(min(100.0, max(0.0, best * 100.0)), 1)
     if p_up >= threshold / 100.0 and p_up > p_down:
-        action = "BUY"
-        reason = f"Calibrated ML probability {confidence:.1f}% reached the {threshold:.1f}% trade threshold."
+        action, reason = "BUY", f"Calibrated ML probability {confidence:.1f}% reached the {threshold:.1f}% trade threshold."
     elif p_down >= threshold / 100.0 and p_down > p_up:
-        action = "SELL"
-        reason = f"Calibrated ML probability {confidence:.1f}% reached the {threshold:.1f}% trade threshold."
+        action, reason = "SELL", f"Calibrated ML probability {confidence:.1f}% reached the {threshold:.1f}% trade threshold."
     else:
-        action = "HOLD"
-        reason = f"Calibrated ML probability {confidence:.1f}% is below the {threshold:.1f}% trade threshold."
-    if used_previous_bar:
-        reason += " Latest 5-minute bar was incomplete, so the last complete bar was used."
+        action, reason = "HOLD", f"Calibrated ML probability {confidence:.1f}% is below the {threshold:.1f}% trade threshold."
+    if used_previous_bar: reason += " Latest 5-minute bar was incomplete, so the last complete bar was used."
     return MLSignal(action, confidence, True, int(meta["samples"]), meta.get("validation_accuracy"), threshold, reason)
