@@ -23,6 +23,7 @@ function IndexCard({ data }) {
   const decision = data?.decision || 'HOLD'
   const live = Boolean(data?.available)
   const option = data?.option
+  const snapshot = option?.mode === 'snapshot'
 
   return <article className="index-card">
     <div className="index-card-top">
@@ -35,8 +36,17 @@ function IndexCard({ data }) {
     <div className="index-target-row"><span>Confidence</span><strong>{data?.confidence ?? '—'}%</strong></div>
     <div className="index-target-row"><span>Target</span><strong>{fmt0(data?.target)}</strong></div>
 
-    {option?.available ? <div className="option-box">
-      <div className="option-contract-row"><span>OPTION:</span><b>{option.contract}</b></div>
+    {snapshot ? <div className="option-box">
+      <div className="option-contract-row"><span>LIVE OPTION SNAPSHOT:</span><b>{option.contract}</b></div>
+      <div className="option-grid">
+        <div><small>CE LTP</small><b>₹{fmt(option.ce_premium)}</b></div>
+        <div><small>PE LTP</small><b>₹{fmt(option.pe_premium)}</b></div>
+        <div><small>CE IV</small><b>{fmt(option.ce_iv)}%</b></div>
+        <div><small>PE IV</small><b>{fmt(option.pe_iv)}%</b></div>
+      </div>
+      <div className="option-foot"><span>{option.source}</span><span>Expiry {option.expiry || '—'}</span><span>CE OI {fmt0(option.ce_oi)}</span><span>PE OI {fmt0(option.pe_oi)}</span><span>CE VOL {fmt0(option.ce_volume)}</span><span>PE VOL {fmt0(option.pe_volume)}</span></div>
+    </div> : option?.available ? <div className="option-box">
+      <div className="option-contract-row"><span>TRADE OPTION:</span><b>{option.contract}</b></div>
       <div className="option-grid">
         <div><small>Premium</small><b>₹{fmt(option.premium)}</b></div>
         <div><small>BUY</small><b>₹{fmt(option.buy_price)}</b></div>
@@ -44,7 +54,7 @@ function IndexCard({ data }) {
         <div><small>STOP</small><b>₹{fmt(option.stop_price)}</b></div>
       </div>
       <div className="option-foot"><span>{option.source}</span><span>Expiry {option.expiry || '—'}</span><span>IV {fmt(option.iv)}%</span><span>OI {fmt0(option.oi)}</span><span>VOL {fmt0(option.volume)}</span></div>
-    </div> : <div className="option-unavailable">{live ? (decision === 'HOLD' ? 'No option trade — calibrated model is below the 95% threshold.' : (option?.reason || 'Live option premium unavailable.')) : 'Live index data unavailable.'}</div>}
+    </div> : <div className="option-unavailable">{live ? (option?.reason || 'Live option-chain data unavailable.') : 'Live index data unavailable.'}</div>}
   </article>
 }
 
