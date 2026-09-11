@@ -2,7 +2,7 @@ import React, {useEffect, useRef, useState} from 'react';
 import {createRoot} from 'react-dom/client';
 import './styles.css';
 
-const API = import.meta.env.VITE_API_URL || 'https://stock-algo-trading.onrender.com';
+const API = import.meta.env.VITE_API_URL || 'https://stock-algo-trading-api.onrender.com';
 const WS = API.replace(/^http/, 'ws') + '/ws';
 
 function App(){
