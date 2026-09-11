@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from sklearn.calibration import CalibratedClassifierCV
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier, VotingClassifier
 from sklearn.model_selection import TimeSeriesSplit
 
 FEATURES = [
@@ -18,6 +18,7 @@ FEATURES = [
 ]
 MODEL_TTL_SECONDS = 600
 MODEL_THRESHOLD_DEFAULT = 95.0
+MODEL_MIN_SAMPLES = 350
 _MODEL_CACHE: dict[str, tuple[float, Any, dict[str, Any]]] = {}
 _MODEL_LOCK = threading.Lock()
 
@@ -49,19 +50,20 @@ def _prepare_features(df: pd.DataFrame) -> pd.DataFrame:
 def _training_set(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series]:
     x = _prepare_features(df)
     close = pd.to_numeric(x["Close"], errors="coerce")
+    # Predict a meaningful 5-minute move, scaled to the instrument's recent
+    # volatility. This avoids labelling every tiny market fluctuation as a trade.
     future_return = close.shift(-5) / close - 1.0
-    move = future_return.abs().dropna()
-    adaptive = float(move.median() * 0.75) if not move.empty else 0.001
-    label_threshold = min(0.004, max(0.0008, adaptive))
+    volatility = close.pct_change().rolling(30).std()
+    adaptive = (volatility * 5.0 * 0.80).clip(lower=0.0008, upper=0.004)
     y = pd.Series(np.nan, index=x.index, dtype=float)
-    y.loc[future_return > label_threshold] = 1.0
-    y.loc[future_return < -label_threshold] = 0.0
+    y.loc[future_return > adaptive] = 1.0
+    y.loc[future_return < -adaptive] = 0.0
     data = x[FEATURES].copy()
     mask = data.notna().all(axis=1) & y.notna()
     return data.loc[mask], y.loc[mask].astype(int)
 
 
-def _calibrated_model(base: RandomForestClassifier, X: pd.DataFrame, y: pd.Series):
+def _calibrated_model(base: Any, X: pd.DataFrame, y: pd.Series):
     splitter = TimeSeriesSplit(n_splits=3)
     for train_idx, test_idx in splitter.split(X):
         if y.iloc[train_idx].nunique() < 2 or y.iloc[test_idx].nunique() < 2:
@@ -73,18 +75,25 @@ def _calibrated_model(base: RandomForestClassifier, X: pd.DataFrame, y: pd.Serie
 
 def _fit(df: pd.DataFrame) -> tuple[Any | None, dict[str, Any]]:
     X, y = _training_set(df)
-    if len(X) < 180 or y.nunique() < 2:
+    if len(X) < MODEL_MIN_SAMPLES or y.nunique() < 2:
         return None, {"samples": int(len(X)), "validation_accuracy": None}
 
-    split = int(len(X) * 0.8)
+    split = int(len(X) * 0.80)
     X_train, X_test = X.iloc[:split], X.iloc[split:]
     y_train, y_test = y.iloc[:split], y.iloc[split:]
     if y_train.nunique() < 2 or y_test.nunique() < 2:
         return None, {"samples": int(len(X)), "validation_accuracy": None}
 
-    base = RandomForestClassifier(
-        n_estimators=180, max_depth=8, min_samples_leaf=4,
+    rf = RandomForestClassifier(
+        n_estimators=240, max_depth=10, min_samples_leaf=5,
         class_weight="balanced_subsample", random_state=42, n_jobs=1,
+    )
+    hgb = HistGradientBoostingClassifier(
+        max_iter=180, learning_rate=0.04, max_leaf_nodes=15,
+        l2_regularization=0.5, random_state=42,
+    )
+    base = VotingClassifier(
+        estimators=[("rf", rf), ("hgb", hgb)], voting="soft", weights=[1.0, 1.2], n_jobs=1
     )
     try:
         validation_model = _calibrated_model(base, X_train, y_train)
