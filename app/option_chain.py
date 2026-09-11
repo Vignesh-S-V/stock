@@ -96,19 +96,21 @@ def fetch_bse_sensex_chain() -> dict[str, Any] | None:
         r.raise_for_status()
         tables = pd.read_html(io.StringIO(r.text))
         rows: list[dict[str, Any]] = []
-        # BSE currently exposes codes such as SENSEX25N0684000CE and
-        # SENSEX25SEP81800PE. The expiry portion is variable-length.
         pattern = re.compile(r"^SENSEX(?P<expiry>\d{2}(?:[A-Z]\d{2}|[A-Z]{3}))(?P<strike>\d+)(?P<type>CE|PE)$")
         for table in tables:
-            text = table.to_string(index=False)
-            if "Series Code" not in text or "LTP" not in text:
+            if table.shape[1] < 2:
                 continue
+            headers = " ".join(str(c) for c in table.columns)
+            if "Series Code" not in headers or "LTP" not in headers:
+                continue
+            code_col = next((c for c in table.columns if "Series Code" in str(c)), table.columns[0])
+            ltp_col = next((c for c in table.columns if str(c).strip() == "LTP"), table.columns[1])
             for _, row in table.iterrows():
-                code = str(row.iloc[0]).strip()
+                code = str(row.get(code_col, "")).strip()
                 match = pattern.match(code)
                 if not match:
                     continue
-                ltp = _num(row.iloc[1])
+                ltp = _num(row.get(ltp_col))
                 if ltp is None or ltp <= 0:
                     continue
                 option_type = match.group("type")
@@ -141,16 +143,18 @@ def _best_strike(rows: list[dict[str, Any]], spot: float, side: str, target: flo
 
 
 def build_option_recommendation(spot: float, action: str, target: float, chain: dict[str, Any] | None) -> dict[str, Any]:
-    if action not in {"BUY", "SELL"} or chain is None:
-        return {"available": False, "reason": "Live option-chain data unavailable"}
+    if action not in {"BUY", "SELL"}:
+        return {"available": False, "reason": "No option trade — model is HOLD"}
+    if chain is None:
+        return {"available": False, "reason": "Live option-chain feed unavailable from the exchange source"}
     option_type = "CE" if action == "BUY" else "PE"
     row = _best_strike(chain["rows"], spot, option_type, target)
     if row is None:
-        return {"available": False, "reason": "No liquid option contract found"}
+        return {"available": False, "reason": "No liquid option contract found in the live chain"}
     leg = row[option_type]
     premium = leg.get("ltp")
     if premium is None or premium <= 0:
-        return {"available": False, "reason": "Option premium unavailable"}
+        return {"available": False, "reason": "Live option premium unavailable for the selected contract"}
     underlying_move = abs(target - spot)
     estimated_premium_move = underlying_move * 0.50
     return {
