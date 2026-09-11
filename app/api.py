@@ -15,7 +15,7 @@ from app.ml_model import predict_ml_signal
 from app.option_chain import build_option_recommendation, fetch_bse_sensex_chain, fetch_nse_chain
 from app.trading import INDEX_UNIVERSE, POPULAR_STOCKS, add_indicators, position_size, score_signal
 
-app = FastAPI(title="Algo Trading Pro API", version="1.2.0")
+app = FastAPI(title="Algo Trading Pro API", version="1.2.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 INDEX_OPTION_SYMBOLS = {"NIFTY 50": "NIFTY", "BANK NIFTY": "BANKNIFTY", "SENSEX": "SENSEX"}
@@ -99,19 +99,19 @@ def model_signal(x: pd.DataFrame, symbol: str, strategy: str, threshold: float):
     if strategy != "Ensemble":
         return technical, None
     ml = predict_ml_signal(x, symbol, threshold=threshold)
-    if ml.action == "BUY":
-        technical.action = "BUY"
-    elif ml.action == "SELL":
-        technical.action = "SELL"
-    else:
-        technical.action = "HOLD"
+    technical.action = ml.action
     technical.confidence = ml.confidence
-    if ml.action == "BUY":
-        technical.stop = technical.entry - 1.5 * (technical.entry - technical.stop) if math.isfinite(technical.stop) else technical.entry * 0.985
-        technical.target = technical.entry + 2.0 * abs(technical.entry - technical.stop)
-    elif ml.action == "SELL":
-        technical.stop = technical.entry + 1.5 * abs(technical.stop - technical.entry) if math.isfinite(technical.stop) else technical.entry * 1.015
-        technical.target = technical.entry - 2.0 * abs(technical.stop - technical.entry)
+    if ml.action in {"BUY", "SELL"}:
+        atr = float(x.iloc[-1].get("ATR_14", 0.0))
+        if not math.isfinite(atr) or atr <= 0:
+            atr = technical.entry * 0.01
+        risk = 1.5 * atr
+        if ml.action == "BUY":
+            technical.stop = technical.entry - risk
+            technical.target = technical.entry + 2.0 * risk
+        else:
+            technical.stop = technical.entry + risk
+            technical.target = technical.entry - 2.0 * risk
     else:
         technical.stop = technical.target = float("nan")
     technical.reasons.append(ml.reason)
@@ -180,7 +180,7 @@ def execute_paper(account: PaperAccount, x: pd.DataFrame, symbol: str, strategy:
 
 @app.get("/")
 def root() -> dict[str, str]:
-    return {"service": "Algo Trading Pro API", "status": "ok", "websocket": "/ws", "version": "1.2.0"}
+    return {"service": "Algo Trading Pro API", "status": "ok", "websocket": "/ws", "version": "1.2.1"}
 
 
 @app.get("/health")
