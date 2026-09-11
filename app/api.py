@@ -11,10 +11,11 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.live_feed import fetch_live_1m
+from app.ml_model import predict_ml_signal
 from app.option_chain import build_option_recommendation, fetch_bse_sensex_chain, fetch_nse_chain
 from app.trading import INDEX_UNIVERSE, POPULAR_STOCKS, add_indicators, position_size, score_signal
 
-app = FastAPI(title="Algo Trading Pro API", version="1.1.2")
+app = FastAPI(title="Algo Trading Pro API", version="1.2.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 INDEX_OPTION_SYMBOLS = {"NIFTY 50": "NIFTY", "BANK NIFTY": "BANKNIFTY", "SENSEX": "SENSEX"}
@@ -75,7 +76,9 @@ def _json_safe(value: Any) -> Any:
 
 
 def market_snapshot(symbol: str) -> tuple[pd.DataFrame | None, float | None]:
-    d = fetch_live_1m(symbol, "1d")
+    # Five days of 1-minute bars gives the ML trainer enough recent samples while
+    # still using the newest Yahoo 1-minute bar for the live price.
+    d = fetch_live_1m(symbol, "5d")
     if d is None or d.empty:
         return None, None
     return add_indicators(d), float(d.Close.iloc[-1])
@@ -91,11 +94,36 @@ def option_chain_cached(name: str) -> dict[str, Any] | None:
     return chain
 
 
-def index_decision(name: str, ticker: str) -> dict[str, Any]:
+def model_signal(x: pd.DataFrame, symbol: str, strategy: str, threshold: float):
+    technical = score_signal(x.iloc[-1], strategy, reward_r=2.0)
+    if strategy != "Ensemble":
+        return technical, None
+    ml = predict_ml_signal(x, symbol, threshold=threshold)
+    if ml.action == "BUY":
+        technical.action = "BUY"
+    elif ml.action == "SELL":
+        technical.action = "SELL"
+    else:
+        technical.action = "HOLD"
+    technical.confidence = ml.confidence
+    if ml.action == "BUY":
+        technical.stop = technical.entry - 1.5 * (technical.entry - technical.stop) if math.isfinite(technical.stop) else technical.entry * 0.985
+        technical.target = technical.entry + 2.0 * abs(technical.entry - technical.stop)
+    elif ml.action == "SELL":
+        technical.stop = technical.entry + 1.5 * abs(technical.stop - technical.entry) if math.isfinite(technical.stop) else technical.entry * 1.015
+        technical.target = technical.entry - 2.0 * abs(technical.stop - technical.entry)
+    else:
+        technical.stop = technical.target = float("nan")
+    technical.reasons.append(ml.reason)
+    technical.reasons.append(f"Training samples: {ml.samples:,} · validation accuracy: {ml.validation_accuracy * 100:.1f}%" if ml.validation_accuracy is not None else f"Training samples: {ml.samples:,}")
+    return technical, ml
+
+
+def index_decision(name: str, ticker: str, threshold: float) -> dict[str, Any]:
     x, spot = market_snapshot(ticker)
     if x is None or spot is None:
         return {"name": name, "symbol": ticker, "available": False, "reason": "Live index data unavailable"}
-    sig = score_signal(x.iloc[-1], "Ensemble", reward_r=2.0)
+    sig, ml = model_signal(x, ticker, "Ensemble", threshold)
     option_chain = option_chain_cached(INDEX_OPTION_SYMBOLS[name])
     option = build_option_recommendation(spot, sig.action, sig.target, option_chain)
     return {
@@ -110,15 +138,16 @@ def index_decision(name: str, ticker: str) -> dict[str, Any]:
         "target": sig.target,
         "risk_reward": sig.risk_reward,
         "reasons": sig.reasons,
+        "model": asdict(ml) if ml else None,
         "option": option,
         "timestamp": time.time(),
     }
 
 
-def execute_paper(account: PaperAccount, x: pd.DataFrame, strategy: str, risk_pct: float, brokerage_pct: float, reward_r: float, threshold: float, strict: bool, auto: bool) -> dict[str, Any]:
+def execute_paper(account: PaperAccount, x: pd.DataFrame, symbol: str, strategy: str, risk_pct: float, brokerage_pct: float, reward_r: float, threshold: float, strict: bool, auto: bool) -> dict[str, Any]:
     row = x.iloc[-1]
     price = float(row["Close"])
-    sig = score_signal(row, strategy, reward_r=reward_r)
+    sig, ml = model_signal(x, symbol, strategy, threshold)
     qualified = sig.action != "HOLD" and sig.confidence >= threshold if strict else sig.action != "HOLD"
     event = ""
     if account.position:
@@ -146,12 +175,12 @@ def execute_paper(account: PaperAccount, x: pd.DataFrame, strategy: str, risk_pc
             event = f"PAPER {sig.action} OPEN · Qty {qty:,} · Entry ₹{price:,.2f}"
     p = account.position
     live_pnl = (price - p.entry) * p.qty if p and p.side == "LONG" else ((p.entry - price) * p.qty if p else 0.0)
-    return {"price": price, "signal": asdict(sig), "qualified": qualified, "position": asdict(p) if p else None, "live_pnl": live_pnl, "cash": account.cash, "realized_pnl": account.realized, "event": event, "timestamp": time.time()}
+    return {"price": price, "signal": asdict(sig), "model": asdict(ml) if ml else None, "qualified": qualified, "position": asdict(p) if p else None, "live_pnl": live_pnl, "cash": account.cash, "realized_pnl": account.realized, "event": event, "timestamp": time.time()}
 
 
 @app.get("/")
 def root() -> dict[str, str]:
-    return {"service": "Algo Trading Pro API", "status": "ok", "websocket": "/ws"}
+    return {"service": "Algo Trading Pro API", "status": "ok", "websocket": "/ws", "version": "1.2.0"}
 
 
 @app.get("/health")
@@ -169,7 +198,7 @@ async def websocket_endpoint(ws: WebSocket) -> None:
     await ws.accept()
     client_id = str(id(ws))
     account = account_for(client_id)
-    config = {"symbol": "RELIANCE.NS", "strategy": "Ensemble", "risk_pct": 1.0, "brokerage_pct": 0.03, "reward_r": 2.0, "threshold": 90.0, "strict": True, "auto": True, "capital": 100000.0}
+    config = {"symbol": "RELIANCE.NS", "strategy": "Ensemble", "risk_pct": 1.0, "brokerage_pct": 0.03, "reward_r": 2.0, "threshold": 95.0, "strict": True, "auto": True, "capital": 100000.0}
     try:
         while True:
             try:
@@ -185,11 +214,10 @@ async def websocket_endpoint(ws: WebSocket) -> None:
             if x is None or price is None:
                 payload = {"type": "error", "message": "Live market data unavailable", "timestamp": time.time()}
             else:
-                result = await asyncio.to_thread(execute_paper, account, x, config["strategy"], float(config["risk_pct"]), float(config["brokerage_pct"]), float(config["reward_r"]), float(config["threshold"]), bool(config["strict"]), bool(config["auto"]))
+                result = await asyncio.to_thread(execute_paper, account, x, config["symbol"], config["strategy"], float(config["risk_pct"]), float(config["brokerage_pct"]), float(config["reward_r"]), float(config["threshold"]), bool(config["strict"]), bool(config["auto"]))
                 indices: dict[str, Any] = {}
-                # Keep the UI order deterministic regardless of INDEX_UNIVERSE dict ordering.
                 for name in INDEX_DISPLAY_ORDER:
-                    indices[name] = await asyncio.to_thread(index_decision, name, INDEX_UNIVERSE[name])
+                    indices[name] = await asyncio.to_thread(index_decision, name, INDEX_UNIVERSE[name], float(config["threshold"]))
                 result["type"] = "tick"
                 result["symbol"] = config["symbol"]
                 result["indices"] = indices
