@@ -42,11 +42,12 @@ class MLSignal:
 def _prepare_features(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy()
     close = pd.to_numeric(x.get("Close"), errors="coerce")
+    volume = pd.to_numeric(x.get("Volume"), errors="coerce").fillna(0.0)
+    x["Volume"] = volume
     x["ATR_PCT"] = pd.to_numeric(x.get("ATR_14"), errors="coerce") / close.replace(0, np.nan) * 100
     x["VWAP_DIST"] = (close - pd.to_numeric(x.get("VWAP"), errors="coerce")) / close.replace(0, np.nan) * 100
     x["EMA9_21"] = (pd.to_numeric(x.get("EMA_9"), errors="coerce") / pd.to_numeric(x.get("EMA_21"), errors="coerce") - 1) * 100
     x["EMA21_50"] = (pd.to_numeric(x.get("EMA_21"), errors="coerce") / pd.to_numeric(x.get("EMA_50"), errors="coerce") - 1) * 100
-    volume = pd.to_numeric(x.get("Volume"), errors="coerce")
     volume_sma = pd.to_numeric(x.get("VOLUME_SMA_20"), errors="coerce")
     x["VOLUME_RATIO"] = volume / volume_sma.replace(0, np.nan)
     return x.replace([np.inf, -np.inf], np.nan)
@@ -104,6 +105,7 @@ def _fetch_training_frame(symbol: str) -> pd.DataFrame:
             index=pd.to_datetime(timestamps, unit="s", utc=True).tz_convert(None),
         )
         frame = frame.dropna(subset=["Open", "High", "Low", "Close"])
+        frame["Volume"] = pd.to_numeric(frame["Volume"], errors="coerce").fillna(0.0)
         return frame.loc[~frame.index.duplicated(keep="last")].sort_index()
     except Exception:
         return pd.DataFrame()
@@ -165,9 +167,14 @@ def _fit(df: pd.DataFrame, symbol: str) -> tuple[Any | None, dict[str, Any]]:
 
 def _prediction_frame(df: pd.DataFrame) -> pd.DataFrame:
     """Convert live 1-minute bars to the same 5-minute feature timeframe used in training."""
-    x = df.copy()
+    x = df[["Open", "High", "Low", "Close", "Volume"]].copy()
+    for column in ["Open", "High", "Low", "Close", "Volume"]:
+        x[column] = pd.to_numeric(x[column], errors="coerce")
+    x["Volume"] = x["Volume"].fillna(0.0)
+    x = x.dropna(subset=["Open", "High", "Low", "Close"])
     if len(x) >= 30:
-        x = x.resample("5min").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}).dropna(subset=["Open", "High", "Low", "Close"])
+        x = x.resample("5min").agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
+        x = x.dropna(subset=["Open", "High", "Low", "Close"])
         x = add_indicators(x)
     return x
 
@@ -190,9 +197,18 @@ def predict_ml_signal(df: pd.DataFrame, symbol: str, threshold: float = MODEL_TH
     prediction_df = _prediction_frame(df)
     if prediction_df.empty:
         return MLSignal("HOLD", 0.0, True, int(meta["samples"]), meta.get("validation_accuracy"), threshold, "Live prediction timeframe is incomplete.")
-    latest = _prepare_features(prediction_df).iloc[[-1]][FEATURES]
-    if latest.isna().any(axis=None):
-        return MLSignal("HOLD", 0.0, True, int(meta["samples"]), meta.get("validation_accuracy"), threshold, "Latest feature row is incomplete.")
+
+    features = _prepare_features(prediction_df)[FEATURES]
+    complete = features.dropna(how="any")
+    if complete.empty:
+        missing = [column for column in FEATURES if features[column].isna().all()]
+        detail = f"Live feature history is incomplete ({', '.join(missing) if missing else 'no complete row'})."
+        return MLSignal("HOLD", 0.0, True, int(meta["samples"]), meta.get("validation_accuracy"), threshold, detail)
+
+    latest_index = features.index[-1]
+    latest_complete_index = complete.index[-1]
+    used_previous_bar = latest_complete_index != latest_index
+    latest = complete.iloc[[-1]]
 
     probabilities = model.predict_proba(latest)[0]
     classes = list(model.classes_)
@@ -210,4 +226,6 @@ def predict_ml_signal(df: pd.DataFrame, symbol: str, threshold: float = MODEL_TH
     else:
         action = "HOLD"
         reason = f"Calibrated ML probability {confidence:.1f}% is below the {threshold:.1f}% trade threshold."
+    if used_previous_bar:
+        reason += " Latest 5-minute bar was incomplete, so the last complete bar was used."
     return MLSignal(action, confidence, True, int(meta["samples"]), meta.get("validation_accuracy"), threshold, reason)
