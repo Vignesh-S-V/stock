@@ -7,3 +7,4 @@ numpy>=1.26,<3
 plotly>=5.24,<7
 pytest>=8,<9
 requests>=2.31,<3
+scikit-learn>=1.5,<2
