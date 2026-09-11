@@ -3,5 +3,5 @@ services:
     name: stock-algo-trading
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: streamlit run app/main.py --server.address=0.0.0.0 --server.port=$PORT
-    healthCheckPath: /_stcore/health
+    startCommand: uvicorn app.api:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
