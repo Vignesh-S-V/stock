@@ -10,11 +10,12 @@ import requests
 def fetch_live_1m(symbol: str, period: str = "1d") -> pd.DataFrame:
     """Fetch a fresh Yahoo chart snapshot without Streamlit/yfinance caching.
 
-    The newest in-progress 1-minute bar is returned when Yahoo provides it.
+    Yahoo's 1-minute endpoint only supports a short recent window. We use up to
+    8 days so the live model gets materially more observations for calibration.
     This is still not a true exchange tick/WebSocket feed.
     """
     now = int(time.time())
-    ranges = {"1d": 86400, "5d": 5 * 86400, "1mo": 31 * 86400}
+    ranges = {"1d": 86400, "5d": 5 * 86400, "8d": 8 * 86400, "1mo": 31 * 86400}
     seconds = ranges.get(period, 86400)
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     params = {
