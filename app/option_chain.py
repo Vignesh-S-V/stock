@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import math
 import re
 import time
@@ -8,11 +9,19 @@ from typing import Any
 import pandas as pd
 import requests
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36",
-    "Accept": "application/json,text/plain,*/*",
+NSE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.nseindia.com/option-chain",
+    "Connection": "keep-alive",
     "Cache-Control": "no-cache",
+}
+BSE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://m.bseindia.com/derivatives.aspx",
 }
 
 
@@ -26,20 +35,30 @@ def _num(value: Any) -> float | None:
 
 def _session() -> requests.Session:
     s = requests.Session()
-    s.headers.update(HEADERS)
+    s.headers.update(NSE_HEADERS)
     try:
-        s.get("https://www.nseindia.com", timeout=5)
+        s.get("https://www.nseindia.com", timeout=6)
     except requests.RequestException:
         pass
     return s
 
 
 def fetch_nse_chain(symbol: str) -> dict[str, Any] | None:
+    """Fetch the first active NSE expiry without inventing option prices."""
     try:
         s = _session()
-        r = s.get("https://www.nseindia.com/api/option-chain-indices", params={"symbol": symbol}, timeout=8)
-        r.raise_for_status()
-        payload = r.json()
+        url = "https://www.nseindia.com/api/option-chain-indices"
+        payload = None
+        for _ in range(2):
+            r = s.get(url, params={"symbol": symbol}, timeout=8)
+            r.raise_for_status()
+            if "json" not in r.headers.get("content-type", "").lower():
+                time.sleep(0.4)
+                continue
+            payload = r.json()
+            break
+        if not isinstance(payload, dict):
+            return None
         records = payload.get("records", {})
         rows = records.get("data", [])
         expiries = records.get("expiryDates", [])
@@ -71,35 +90,34 @@ def fetch_nse_chain(symbol: str) -> dict[str, Any] | None:
 
 
 def fetch_bse_sensex_chain() -> dict[str, Any] | None:
-    """Best-effort public BSE derivatives market-watch feed.
-
-    BSE exposes the SENSEX option contracts on its derivatives market-watch
-    page. We parse the rendered table and only use an observed LTP; no price is
-    fabricated when the public page changes or is unavailable.
-    """
+    """Best-effort BSE SENSEX derivatives market-watch feed."""
     try:
-        r = requests.get("https://m.bseindia.com/derivatives.aspx", headers=HEADERS, timeout=8)
+        r = requests.get("https://m.bseindia.com/derivatives.aspx", headers=BSE_HEADERS, timeout=8)
         r.raise_for_status()
-        tables = pd.read_html(r.text)
+        tables = pd.read_html(io.StringIO(r.text))
         rows: list[dict[str, Any]] = []
+        # BSE currently exposes codes such as SENSEX25N0684000CE and
+        # SENSEX25SEP81800PE. The expiry portion is variable-length.
+        pattern = re.compile(r"^SENSEX(?P<expiry>\d{2}(?:[A-Z]\d{2}|[A-Z]{3}))(?P<strike>\d+)(?P<type>CE|PE)$")
         for table in tables:
             text = table.to_string(index=False)
             if "Series Code" not in text or "LTP" not in text:
                 continue
             for _, row in table.iterrows():
-                code = str(row.iloc[0])
-                match = re.search(r"SENSEX\d{2}[A-Z]{3}(\d{6})(CE|PE)$", code)
+                code = str(row.iloc[0]).strip()
+                match = pattern.match(code)
                 if not match:
                     continue
                 ltp = _num(row.iloc[1])
                 if ltp is None or ltp <= 0:
                     continue
+                option_type = match.group("type")
                 rows.append({
-                    "strike": float(match.group(1)),
-                    "expiry": code[6:11],
+                    "strike": float(match.group("strike")),
+                    "expiry": match.group("expiry"),
                     "contract_code": code,
-                    "CE": {"ltp": ltp} if match.group(2) == "CE" else {},
-                    "PE": {"ltp": ltp} if match.group(2) == "PE" else {},
+                    "CE": {"ltp": ltp} if option_type == "CE" else {},
+                    "PE": {"ltp": ltp} if option_type == "PE" else {},
                 })
         if not rows:
             return None
