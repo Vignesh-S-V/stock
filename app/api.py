@@ -13,7 +13,7 @@ from app.news import get_news, news_confirmation
 from app.option_chain import build_option_recommendation, fetch_bse_sensex_chain, fetch_nse_chain
 from app.trading import INDEX_UNIVERSE, POPULAR_STOCKS, add_indicators, position_size, score_signal
 
-app = FastAPI(title="Algo Trading Pro API", version="1.4.0")
+app = FastAPI(title="Algo Trading Pro API", version="1.4.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 INDEX_OPTION_SYMBOLS = {"NIFTY 50": "NIFTY", "BANK NIFTY": "BANKNIFTY", "SENSEX": "SENSEX"}
 INDEX_DISPLAY_ORDER = ("NIFTY 50", "BANK NIFTY", "SENSEX")
@@ -114,7 +114,7 @@ def execute_paper(account: PaperAccount,x: pd.DataFrame, symbol: str,strategy: s
     return {"price":price,"signal":asdict(sig),"model":asdict(ml) if ml else None,"qualified":qualified,"position":asdict(p) if p else None,"live_pnl":live_pnl,"cash":account.cash,"realized_pnl":account.realized,"event":event,"timestamp":time.time()}
 
 @app.get("/")
-def root(): return {"service":"Algo Trading Pro API","status":"ok","websocket":"/ws","version":"1.4.0"}
+def root(): return {"service":"Algo Trading Pro API","status":"ok","websocket":"/ws","version":"1.4.1"}
 @app.get("/health")
 def health(): return {"status":"ok"}
 @app.get("/universe")
@@ -143,11 +143,16 @@ async def websocket_endpoint(ws: WebSocket):
                     asyncio.create_task(asyncio.to_thread(prewarm_ml_model,x,config["symbol"]))
                 news_data=await asyncio.to_thread(news_cached,config["symbol"])
                 result=await asyncio.to_thread(execute_paper,account,x,config["symbol"],config["strategy"],float(config["risk_pct"]),float(config["brokerage_pct"]),float(config["reward_r"]),float(config["threshold"]),bool(config["strict"]),bool(config["auto"]),news_data)
-                result["type"]="tick"; result["symbol"]=config["symbol"]; result["news"]=news_data; result["indices"]={}; await ws.send_json(_json_safe(result))
-                jobs=[]
-                for name in INDEX_DISPLAY_ORDER: jobs.append(asyncio.to_thread(index_decision,name,INDEX_UNIVERSE[name],float(config["threshold"])))
-                index_results=await asyncio.gather(*jobs)
-                result["indices"]=dict(zip(INDEX_DISPLAY_ORDER,index_results)); result["timestamp"]=time.time()
+                result["type"]="tick"; result["symbol"]=config["symbol"]; result["news"]=news_data
+                await ws.send_json(_json_safe(result))
+                async def load_indices():
+                    jobs=[asyncio.to_thread(index_decision,name,INDEX_UNIVERSE[name],float(config["threshold"])) for name in INDEX_DISPLAY_ORDER]
+                    return dict(zip(INDEX_DISPLAY_ORDER,await asyncio.gather(*jobs,return_exceptions=False)))
+                try:
+                    result["indices"]=await asyncio.wait_for(load_indices(),timeout=8.0)
+                except (asyncio.TimeoutError,Exception):
+                    result["indices"]={}
+                result["timestamp"]=time.time()
                 await ws.send_json(_json_safe(result))
                 await asyncio.sleep(1.0); continue
             await ws.send_json(_json_safe(payload)); await asyncio.sleep(1.0)
