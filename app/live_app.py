@@ -26,7 +26,7 @@ def _chart(x,sig,pos=None):
     for c in ["EMA_9","EMA_21","EMA_50","VWAP"]:
         if c in y: fig.add_trace(go.Scatter(x=y.index,y=y[c],mode="lines",name=c.replace("_"," ")))
     if sig.action!="HOLD":
-        for val,text,dash in [(sig.entry,"ENTRY", "dot"),(sig.stop,"STOP","dash"),(sig.target,"TARGET","dash")]: fig.add_hline(y=val,line_dash=dash,annotation_text=f"{text} {_money(val)}")
+        for val,text,dash in [(sig.entry,"ENTRY","dot"),(sig.stop,"STOP","dash"),(sig.target,"TARGET","dash")]: fig.add_hline(y=val,line_dash=dash,annotation_text=f"{text} {_money(val)}")
     if pos:
         for val,text in [(pos.entry,f"OPEN {pos.side}"),(pos.stop,"LIVE STOP"),(pos.target,"LIVE TARGET")]: fig.add_hline(y=val,line_dash="dot" if text.startswith("OPEN") else "dash",annotation_text=f"{text} {_money(val)}")
     fig.update_layout(height=500,template="plotly_dark",paper_bgcolor="#080b10",plot_bgcolor="#080b10",margin=dict(l=8,r=8,t=25,b=8),xaxis_rangeslider_visible=False,hovermode="x unified",legend=dict(orientation="h",y=1.02,x=0))
@@ -64,7 +64,7 @@ def render_app():
 
     df=_data(symbol,period,interval)
     if df is None or df.empty: st.error(f"No market data for {symbol}. Try 1d + 1mo."); return
-    x=add_indicators(df); sig=score_signal(x.iloc[-1],strategy,reward_r=reward); qualified=sig.action!="HOLD" and sig.confidence>=threshold if strict else sig.action!="HOLD"; qty=position_size(capital,risk,sig.entry,sig.stop) if qualified else 0; last=float(x.Close.iloc[-1]); prev=float(x.Close.iloc[-2]) if len(x)>1 else last
+    x=add_indicators(df); sig=score_signal(x.iloc[-1],strategy,reward_r=reward); qualified=sig.action!="HOLD" and sig.confidence>=threshold if strict else sig.action!="HOLD"; qty=position_size(capital,risk,sig.entry,sig.stop) if qualified else 0; last=float(x.Close.iloc[-1])
     if auto and qualified: process_latest_bar(x,strategy,risk,brokerage,reward)
     pos=_position_from_state(st.session_state.get("paper_position"))
 
