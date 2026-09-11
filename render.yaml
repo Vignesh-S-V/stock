@@ -2,6 +2,6 @@ services:
   - type: web
     name: stock-algo-trading
     runtime: python
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt fastapi uvicorn[standard]
     startCommand: uvicorn app.api:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
