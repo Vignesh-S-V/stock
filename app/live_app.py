@@ -55,14 +55,14 @@ def _style():
     .brand{font-size:31px;font-weight:900}.sub{font-size:12px;color:#82909e;margin-top:3px}.section{font-size:19px;font-weight:850;margin:15px 0 8px}
     .signal{border:1px solid #2c3a48;border-radius:15px;padding:17px;background:#0d141c}.action{font-size:46px;font-weight:950;line-height:1}.buy{color:#58e39b}.sell{color:#ff7076}.hold{color:#e7c85b}
     div[data-testid="stMetric"]{background:#0e151d;border:1px solid #222e3a;border-radius:12px;padding:8px 10px}
-    .livebar{font-size:10px;color:#6ee39a;font-weight:850;letter-spacing:.5px;margin:2px 0 6px}.up{color:#58e39b}.down{color:#ff7076}
+    .livebar{font-size:10px;color:#6ee39a;font-weight:850;letter-spacing:.5px;margin:2px 0 6px}
     </style>
     """, unsafe_allow_html=True)
 
 
 @st.fragment(run_every="1s")
-def _live_market_fragment(index_snapshot: list[tuple[str, str, float]], symbol: str, fallback_price: float, position_state):
-    """Only this block reruns every second. The rest of the dashboard stays untouched."""
+def _live_market_fragment(index_snapshot: list[tuple[str, str, float]], symbol: str, fallback_price: float):
+    """Only this block reruns every second; the rest of the dashboard stays static."""
     rows = []
     for name, ticker, fallback in index_snapshot:
         live = fetch_live_1m(ticker, "1d")
@@ -72,25 +72,23 @@ def _live_market_fragment(index_snapshot: list[tuple[str, str, float]], symbol: 
     selected = fetch_live_1m(symbol, "1d")
     selected_price = float(selected.Close.iloc[-1]) if selected is not None and not selected.empty else fallback_price
 
-    st.markdown("<div class='livebar'>● LIVE QUOTES · SERVER-SIDE 1 SECOND POLLING · ONLY THIS SECTION UPDATES</div>", unsafe_allow_html=True)
+    st.markdown("<div class='livebar'>● LIVE QUOTES · SERVER-SIDE 1 SECOND POLLING · ONLY THESE NUMBERS UPDATE</div>", unsafe_allow_html=True)
     cols = st.columns(3)
     for col, (name, ticker, price) in zip(cols, rows):
         with col:
             st.metric(name, f"₹{price:,.2f}", help=f"{ticker} · refreshed {_now()}")
 
+    # Read the current session state on EVERY fragment run. This is important:
+    # the paper position can be opened by the main app after the fragment first mounts.
+    position_state = st.session_state.get("paper_position")
     if position_state:
         pos = _position_from_state(position_state)
         if pos:
-            if pos.side == "LONG":
-                pnl = (selected_price - pos.entry) * pos.qty
-            else:
-                pnl = (pos.entry - selected_price) * pos.qty
+            pnl = (selected_price - pos.entry) * pos.qty if pos.side == "LONG" else (pos.entry - selected_price) * pos.qty
             p1, p2, p3 = st.columns(3)
             p1.metric("PAPER LIVE PRICE", f"₹{selected_price:,.2f}")
             p2.metric("ENTRY", _money(pos.entry))
             p3.metric("UNREALISED P/L", f"{'+' if pnl >= 0 else '-'}₹{abs(pnl):,.2f}")
-
-    return selected_price
 
 
 def render_app():
@@ -123,37 +121,36 @@ def render_app():
     _init_state(capital)
 
     st.markdown(f"<div class='hero'><div class='brand'>ALGO TRADING PRO</div><div class='sub'>Indian Market Command Center · NIFTY 50 · SENSEX · BANK NIFTY · loaded {_now()}</div></div>", unsafe_allow_html=True)
-    st.markdown("<div class='section'>🇮🇳 Indian Market · Live Overview</div>", unsafe_allow_html=True)
-
-    index_snapshot = []
-    for index_name, index_symbol in INDEX_UNIVERSE.items():
-        d = fetch_live_1m(index_symbol, "1d")
-        if d is not None and not d.empty:
-            index_snapshot.append((index_name, index_symbol, float(d.Close.iloc[-1])))
-    if len(index_snapshot) == 3:
-        # This is deliberately a Streamlit fragment, not a whole-page rerun.
-        _live_market_fragment(index_snapshot, symbol, float(index_snapshot[0][2]), st.session_state.get("paper_position"))
-    else:
-        st.error("Live index feed did not return all three indexes. NIFTY 50, SENSEX and BANK NIFTY must all be available before rendering the live cards.")
 
     df = _data(symbol, period, interval)
     if df is None or df.empty:
-        st.error(f"No market data for {symbol}. Try 1d + 1mo."); return
+        st.error(f"No market data for {symbol}. Try 1d + 1mo"); return
     x = add_indicators(df)
     sig = score_signal(x.iloc[-1], strategy, reward_r=reward)
     qualified = sig.action != "HOLD" and sig.confidence >= threshold if strict else sig.action != "HOLD"
     qty = position_size(capital, risk, sig.entry, sig.stop) if qualified else 0
     last = float(x.Close.iloc[-1])
 
-    # The paper engine was previously called without initializing its session state.
-    # That made AUTO PAPER TRADING unable to open a position reliably.
+    # Initialize state BEFORE any live fragment starts, then let the automatic paper engine act.
     if auto and qualified:
         process_latest_bar(x, strategy, risk, brokerage, reward)
     pos = _position_from_state(st.session_state.get("paper_position"))
 
+    st.markdown("<div class='section'>🇮🇳 Indian Market · Live Overview</div>", unsafe_allow_html=True)
+    index_snapshot = []
+    for index_name, index_symbol in INDEX_UNIVERSE.items():
+        d = fetch_live_1m(index_symbol, "1d")
+        if d is not None and not d.empty:
+            index_snapshot.append((index_name, index_symbol, float(d.Close.iloc[-1])))
+    if len(index_snapshot) == 3:
+        # Streamlit reruns ONLY this fragment every second. The main page/chart do not rerun.
+        _live_market_fragment(index_snapshot, symbol, last)
+    else:
+        st.error("Live index feed did not return all three indexes. NIFTY 50, SENSEX and BANK NIFTY must all be available before rendering the live cards.")
+
     st.markdown("<div class='section'>⚡ Automatic Paper Trading</div>", unsafe_allow_html=True)
     if pos:
-        st.success(f"PAPER {pos.side} OPEN · Qty {pos.qty:,} · Entry {_money(pos.entry)} · live price/P&L is updated above every second")
+        st.success(f"PAPER {pos.side} OPEN · Qty {pos.qty:,} · Entry {_money(pos.entry)} · Live Price/P&L updates every second above")
         p1, p2, p3, p4 = st.columns(4)
         p1.metric("POSITION", pos.side); p2.metric("QTY", f"{pos.qty:,}"); p3.metric("STOP", _money(pos.stop)); p4.metric("TARGET", _money(pos.target))
     elif qualified:
