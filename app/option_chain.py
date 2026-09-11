@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import math
+import re
 import time
 from typing import Any
 
+import pandas as pd
 import requests
 
 HEADERS = {
@@ -12,6 +14,14 @@ HEADERS = {
     "Referer": "https://www.nseindia.com/option-chain",
     "Cache-Control": "no-cache",
 }
+
+
+def _num(value: Any) -> float | None:
+    try:
+        x = float(value)
+        return x if math.isfinite(x) else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _session() -> requests.Session:
@@ -24,27 +34,10 @@ def _session() -> requests.Session:
     return s
 
 
-def _num(value: Any) -> float | None:
-    try:
-        x = float(value)
-        return x if math.isfinite(x) else None
-    except (TypeError, ValueError):
-        return None
-
-
 def fetch_nse_chain(symbol: str) -> dict[str, Any] | None:
-    """Fetch live NSE option-chain data for NIFTY/BANKNIFTY.
-
-    Exchange data is used for premium/bid/ask/IV/OI. If the public endpoint
-    cannot be reached, return None rather than inventing option prices.
-    """
     try:
         s = _session()
-        r = s.get(
-            "https://www.nseindia.com/api/option-chain-indices",
-            params={"symbol": symbol},
-            timeout=8,
-        )
+        r = s.get("https://www.nseindia.com/api/option-chain-indices", params={"symbol": symbol}, timeout=8)
         r.raise_for_status()
         payload = r.json()
         records = payload.get("records", {})
@@ -77,6 +70,44 @@ def fetch_nse_chain(symbol: str) -> dict[str, Any] | None:
         return None
 
 
+def fetch_bse_sensex_chain() -> dict[str, Any] | None:
+    """Best-effort public BSE derivatives market-watch feed.
+
+    BSE exposes the SENSEX option contracts on its derivatives market-watch
+    page. We parse the rendered table and only use an observed LTP; no price is
+    fabricated when the public page changes or is unavailable.
+    """
+    try:
+        r = requests.get("https://m.bseindia.com/derivatives.aspx", headers=HEADERS, timeout=8)
+        r.raise_for_status()
+        tables = pd.read_html(r.text)
+        rows: list[dict[str, Any]] = []
+        for table in tables:
+            text = table.to_string(index=False)
+            if "Series Code" not in text or "LTP" not in text:
+                continue
+            for _, row in table.iterrows():
+                code = str(row.iloc[0])
+                match = re.search(r"SENSEX\d{2}[A-Z]{3}(\d{6})(CE|PE)$", code)
+                if not match:
+                    continue
+                ltp = _num(row.iloc[1])
+                if ltp is None or ltp <= 0:
+                    continue
+                rows.append({
+                    "strike": float(match.group(1)),
+                    "expiry": code[6:11],
+                    "contract_code": code,
+                    "CE": {"ltp": ltp} if match.group(2) == "CE" else {},
+                    "PE": {"ltp": ltp} if match.group(2) == "PE" else {},
+                })
+        if not rows:
+            return None
+        return {"source": "BSE", "symbol": "SENSEX", "expiry": rows[0]["expiry"], "rows": rows}
+    except (requests.RequestException, ValueError, ImportError, TypeError):
+        return None
+
+
 def _best_strike(rows: list[dict[str, Any]], spot: float, side: str, target: float) -> dict[str, Any] | None:
     candidates = []
     for row in rows:
@@ -102,24 +133,19 @@ def build_option_recommendation(spot: float, action: str, target: float, chain: 
     premium = leg.get("ltp")
     if premium is None or premium <= 0:
         return {"available": False, "reason": "Option premium unavailable"}
-
-    # The model's underlying target is converted into a conservative option
-    # premium planning range. Live LTP is always the actual reference entry.
     underlying_move = abs(target - spot)
     estimated_premium_move = underlying_move * 0.50
-    target_price = premium + estimated_premium_move
-    stop_price = max(0.05, premium - estimated_premium_move * 0.60)
     return {
         "available": True,
         "source": chain["source"],
         "expiry": chain["expiry"],
         "strike": row["strike"],
         "type": option_type,
-        "contract": f"{int(row['strike'])} {option_type}",
+        "contract": row.get("contract_code") or f"{int(row['strike'])} {option_type}",
         "premium": premium,
         "buy_price": premium,
-        "target_price": round(target_price, 2),
-        "stop_price": round(stop_price, 2),
+        "target_price": round(premium + estimated_premium_move, 2),
+        "stop_price": round(max(0.05, premium - estimated_premium_move * 0.60), 2),
         "bid": leg.get("bid"),
         "ask": leg.get("ask"),
         "iv": leg.get("iv"),
