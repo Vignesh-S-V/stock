@@ -6,8 +6,13 @@ import numpy as np, pandas as pd, requests
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier, VotingClassifier
 from sklearn.metrics import balanced_accuracy_score
-from sklearn.model_selection import StratifiedKFold, TimeSeriesSplit
+from sklearn.model_selection import StratifiedKFold
 from app.trading import add_indicators
+
+try:
+    from xgboost import XGBClassifier
+except Exception:
+    XGBClassifier = None
 
 FEATURES=["RSI_14","MACD","MACD_HIST","ATR_PCT","BB_WIDTH","VWAP_DIST","ROC_12","RET_1","RET_5","RET_20","ADX_14","STOCH_K","STOCH_D","CCI_20","EMA9_21","EMA21_50","VOLUME_RATIO"]
 MODEL_TTL_SECONDS=600; MODEL_THRESHOLD_DEFAULT=95.0; MODEL_MIN_SAMPLES=700; TRAIN_PERIOD_SECONDS=60*86400
@@ -30,16 +35,12 @@ def _training_set(df):
     x=_prepare_features(df); close=pd.to_numeric(x["Close"],errors="coerce"); future_return=close.shift(-3)/close-1.0; volatility=close.pct_change().rolling(30).std()
     adaptive=(volatility*3.0*0.75).clip(lower=0.0006,upper=0.0035)
     y=pd.Series(np.nan,index=x.index,dtype=float); y.loc[future_return>adaptive]=1.0; y.loc[future_return<-adaptive]=0.0
-    data=x[FEATURES].copy(); mask=data.notna().all(axis=1)&y.notna(); X,y=X_y=data.loc[mask],y.loc[mask].astype(int)
-    # Keep the volatility-aware target when it has enough examples, but avoid
-    # calibration failure when a long one-sided market period removes a class.
-    if len(y) and y.nunique()<2 or (len(y) and y.value_counts(normalize=True).min()<0.05):
-        fallback=pd.Series(np.nan,index=x.index,dtype=float)
-        fallback.loc[future_return>0.0005]=1.0; fallback.loc[future_return<-0.0005]=0.0
+    data=x[FEATURES].copy(); mask=data.notna().all(axis=1)&y.notna(); X,y=data.loc[mask],y.loc[mask].astype(int)
+    if len(y) and (y.nunique()<2 or y.value_counts(normalize=True).min()<0.05):
+        fallback=pd.Series(np.nan,index=x.index,dtype=float); fallback.loc[future_return>0.0005]=1.0; fallback.loc[future_return<-0.0005]=0.0
         mask=data.notna().all(axis=1)&fallback.notna(); X,y=data.loc[mask],fallback.loc[mask].astype(int)
     if len(y) and y.nunique()<2:
-        fallback=(future_return>0).astype(float).where(future_return.notna())
-        mask=data.notna().all(axis=1)&fallback.notna(); X,y=data.loc[mask],fallback.loc[mask].astype(int)
+        fallback=(future_return>0).astype(float).where(future_return.notna()); mask=data.notna().all(axis=1)&fallback.notna(); X,y=data.loc[mask],fallback.loc[mask].astype(int)
     return X,y
 
 def _fetch_training_frame(symbol):
@@ -52,10 +53,15 @@ def _fetch_training_frame(symbol):
         f=pd.DataFrame({"Open":q.get("open",[]),"High":q.get("high",[]),"Low":q.get("low",[]),"Close":q.get("close",[]),"Volume":q.get("volume",[])},index=pd.to_datetime(ts,unit="s",utc=True).tz_convert(None)); f=f.dropna(subset=["Open","High","Low","Close"]); f["Volume"]=pd.to_numeric(f["Volume"],errors="coerce").fillna(0.0); return f.loc[~f.index.duplicated(keep="last")].sort_index()
     except Exception:return pd.DataFrame()
 
+def _make_base():
+    rf=RandomForestClassifier(n_estimators=140,max_depth=10,min_samples_leaf=6,class_weight="balanced_subsample",random_state=42,n_jobs=1)
+    if XGBClassifier is not None:
+        xgb=XGBClassifier(n_estimators=180,max_depth=4,learning_rate=0.04,subsample=0.85,colsample_bytree=0.85,min_child_weight=4,reg_lambda=2.0,objective="binary:logistic",eval_metric="logloss",tree_method="hist",n_jobs=1,random_state=42)
+        return VotingClassifier(estimators=[("rf",rf),("xgb",xgb)],voting="soft",weights=[1.0,1.4],n_jobs=1), "RandomForest + XGBoost"
+    hgb=HistGradientBoostingClassifier(max_iter=140,learning_rate=0.035,max_leaf_nodes=15,l2_regularization=1.0,random_state=42)
+    return VotingClassifier(estimators=[("rf",rf),("hgb",hgb)],voting="soft",weights=[1.0,1.3],n_jobs=1), "RandomForest + HistGradientBoosting"
+
 def _calibrated_model(base,X,y):
-    # Time-ordered validation remains the quality gate in _fit. Calibration
-    # itself uses stratified folds so every calibration fold contains both
-    # classes even during strongly one-sided market periods.
     if y.nunique()<2 or y.value_counts().min()<3:return None
     folds=min(3,int(y.value_counts().min()))
     if folds<2:return None
@@ -65,19 +71,19 @@ def _calibrated_model(base,X,y):
 def _fit(df,symbol):
     training=_fetch_training_frame(symbol)
     if len(training)<1000:training=df.copy()
-    if training.empty:return None,{"samples":0,"validation_accuracy":None,"reason":"No training data was returned."}
+    if training.empty:return None,{"samples":0,"validation_accuracy":None,"reason":"No training data was returned.","engine":"Unavailable"}
     X,y=_training_set(add_indicators(training))
-    if len(X)<MODEL_MIN_SAMPLES or y.nunique()<2:return None,{"samples":int(len(X)),"validation_accuracy":None,"reason":f"Training set has {len(X)} rows and {y.nunique()} classes."}
+    if len(X)<MODEL_MIN_SAMPLES or y.nunique()<2:return None,{"samples":int(len(X)),"validation_accuracy":None,"reason":f"Training set has {len(X)} rows and {y.nunique()} classes.","engine":"Not ready"}
     split=int(len(X)*0.80); X_train,X_test=X.iloc[:split],X.iloc[split:]; y_train,y_test=y.iloc[:split],y.iloc[split:]
-    if y_train.nunique()<2 or y_test.nunique()<2:return None,{"samples":int(len(X)),"validation_accuracy":None,"reason":"Chronological validation window contains only one class."}
-    rf=RandomForestClassifier(n_estimators=140,max_depth=10,min_samples_leaf=6,class_weight="balanced_subsample",random_state=42,n_jobs=1); hgb=HistGradientBoostingClassifier(max_iter=140,learning_rate=0.035,max_leaf_nodes=15,l2_regularization=1.0,random_state=42); base=VotingClassifier(estimators=[("rf",rf),("hgb",hgb)],voting="soft",weights=[1.0,1.3],n_jobs=1)
+    if y_train.nunique()<2 or y_test.nunique()<2:return None,{"samples":int(len(X)),"validation_accuracy":None,"reason":"Chronological validation window contains only one class.","engine":"Not ready"}
+    base,engine=_make_base()
     try:
         vm=_calibrated_model(base,X_train,y_train)
-        if vm is None:return None,{"samples":int(len(X)),"validation_accuracy":None,"reason":"Calibration training window has insufficient class diversity."}
+        if vm is None:return None,{"samples":int(len(X)),"validation_accuracy":None,"reason":"Calibration training window has insufficient class diversity.","engine":engine}
         acc=float(balanced_accuracy_score(y_test,vm.predict(X_test))); fm=_calibrated_model(base,X,y)
-        if fm is None:return None,{"samples":int(len(X)),"validation_accuracy":acc,"reason":"Final calibration window has insufficient class diversity."}
-    except (ValueError,RuntimeError,TypeError) as exc:return None,{"samples":int(len(X)),"validation_accuracy":None,"reason":f"Calibration failed: {type(exc).__name__}."}
-    return fm,{"samples":int(len(X)),"validation_accuracy":acc,"reason":"Calibrated model ready."}
+        if fm is None:return None,{"samples":int(len(X)),"validation_accuracy":acc,"reason":"Final calibration window has insufficient class diversity.","engine":engine}
+    except (ValueError,RuntimeError,TypeError) as exc:return None,{"samples":int(len(X)),"validation_accuracy":None,"reason":f"Calibration failed: {type(exc).__name__}.","engine":engine}
+    return fm,{"samples":int(len(X)),"validation_accuracy":acc,"reason":"Calibrated model ready.","engine":engine}
 
 def _prediction_frame(df):
     x=df[["Open","High","Low","Close","Volume"]].copy()
@@ -108,7 +114,7 @@ def predict_ml_signal(df,symbol,threshold=MODEL_THRESHOLD_DEFAULT,train_if_missi
     threshold=min(100.0,max(50.0,float(threshold))); now=time.time()
     with _MODEL_LOCK:
         cached=_MODEL_CACHE.get(symbol)
-        if cached and now-cached[0]<MODEL_TTL_SECONDS: model,meta=cached[1],cached[2]
+        if cached and now-cached[0]<MODEL_TTL_SECONDS:model,meta=cached[1],cached[2]
         elif not train_if_missing:return MLSignal("HOLD",0.0,False,0,None,threshold,"Model is training in the background.")
         else:model=None; meta=None
     if model is None:
@@ -124,6 +130,7 @@ def predict_ml_signal(df,symbol,threshold=MODEL_THRESHOLD_DEFAULT,train_if_missi
     if p_up>=threshold/100.0 and p_up>p_down:action="BUY"
     elif p_down>=threshold/100.0 and p_down>p_up:action="SELL"
     else:action="HOLD"
-    reason=f"Calibrated ML probability {confidence:.1f}% {'reached' if action!='HOLD' else 'is below'} the {threshold:.1f}% trade threshold."
+    engine=meta.get("engine","Calibrated ensemble")
+    reason=f"{engine} calibrated probability {confidence:.1f}% {'reached' if action!='HOLD' else 'is below'} the {threshold:.1f}% trade threshold."
     if latest_complete_index!=latest_index:reason+=" Latest 5-minute bar was incomplete, so the last complete bar was used."
     return MLSignal(action,confidence,True,int(meta["samples"]),meta.get("validation_accuracy"),threshold,reason)
