@@ -9,10 +9,7 @@ const DEFAULTS = { strategy: 'Ensemble', risk_pct: 1, brokerage_pct: 0.03, rewar
 function fmt(x) {
   const n = Number(x)
   if (!Number.isFinite(n)) return '—'
-  return n.toLocaleString('en-IN', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2
-  })
+  return n.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 }
 
 function fmt0(x) {
@@ -24,16 +21,43 @@ function cls(value) { return String(value || 'hold').toLowerCase().replace(/\s+/
 
 function IndexCard({ data }) {
   const decision = data?.decision || 'HOLD'
+  const direction = decision === 'BUY' ? 'UP' : decision === 'SELL' ? 'DOWN' : 'SIDEWAYS'
   const option = data?.option
+  const live = Boolean(data?.available)
+
   return <article className="index-card">
-    <div className="index-head"><div><small>{data?.name || 'INDEX'}</small><strong>₹{fmt(data?.price)}</strong></div><span className={'decision ' + cls(decision)}>{decision}</span></div>
-    <div className="index-meta"><span>MODEL {data?.confidence ?? '—'}%</span><span>ENTRY ₹{fmt(data?.entry)}</span><span>TARGET ₹{fmt(data?.target)}</span></div>
-    <div className="reasons">{(data?.reasons || []).slice(-3).map((r, i) => <span key={i}>• {r}</span>)}</div>
+    <div className="index-card-top">
+      <h3>{data?.name || 'INDEX'}</h3>
+      <span className={'live-badge ' + (live ? 'live' : 'offline')}>{live ? '🟢 LIVE' : '⚪ OFFLINE'}</span>
+    </div>
+
+    <div className="index-price-row">
+      <span>Spot</span>
+      <strong>₹{fmt0(data?.price)}</strong>
+    </div>
+
+    <div className="index-decision-row">
+      <span>MODEL DECISION</span>
+      <strong className={'decision ' + cls(decision)}>
+        {decision === 'BUY' ? '🟢 BUY / UP' : decision === 'SELL' ? '🔴 SELL / DOWN' : '🟡 HOLD / SIDEWAYS'}
+      </strong>
+    </div>
+
+    <div className="index-target-row">
+      <span>Target</span>
+      <strong>{fmt0(data?.target)}</strong>
+    </div>
+
     {option?.available ? <div className="option-box">
-      <div className="option-title"><b>{option.contract}</b><span>{option.expiry}</span></div>
-      <div className="option-grid"><div><small>LIVE PREMIUM</small><b>₹{fmt(option.premium)}</b></div><div><small>BUY</small><b>₹{fmt(option.buy_price)}</b></div><div><small>SELL / TARGET</small><b>₹{fmt(option.target_price)}</b></div><div><small>STOP</small><b>₹{fmt(option.stop_price)}</b></div></div>
-      <div className="option-foot"><span>IV {fmt(option.iv)}%</span><span>OI {fmt0(option.oi)}</span><span>VOL {fmt0(option.volume)}</span><span>{option.source}</span></div>
-    </div> : <div className="option-unavailable">{decision === 'HOLD' ? 'No option trade — model is HOLD.' : (option?.reason || 'Live option premium unavailable.')}</div>}
+      <div className="option-contract-row"><span>OPTION:</span><b>{option.contract}</b></div>
+      <div className="option-grid">
+        <div><small>Premium</small><b>₹{fmt(option.premium)}</b></div>
+        <div><small>BUY</small><b>₹{fmt(option.buy_price)}</b></div>
+        <div><small>TARGET / SELL</small><b>₹{fmt(option.target_price)}</b></div>
+        <div><small>STOP</small><b>₹{fmt(option.stop_price)}</b></div>
+      </div>
+      <div className="option-foot"><span>{option.source}</span><span>IV {fmt(option.iv)}%</span><span>OI {fmt0(option.oi)}</span><span>VOL {fmt0(option.volume)}</span></div>
+    </div> : <div className="option-unavailable">{live ? (decision === 'HOLD' ? 'No option trade — model is HOLD.' : (option?.reason || 'Live option premium unavailable.')) : 'Live index data unavailable.'}</div>}
   </article>
 }
 
@@ -58,6 +82,7 @@ function App() {
       ws.onopen = () => {
         if (!stopped) {
           setConnected(true)
+          setError('')
           ws.send(JSON.stringify({ symbol, ...config }))
         }
       }
@@ -67,7 +92,9 @@ function App() {
           setState(next)
           setLastTick(new Date())
           setError(next.type === 'error' ? next.message : '')
-        } catch { setError('Invalid server response') }
+        } catch {
+          setError('Invalid server response')
+        }
       }
       ws.onerror = () => { if (!stopped) setError('WebSocket connection error') }
       ws.onclose = () => {
@@ -109,7 +136,7 @@ function App() {
       <div><small>PAPER P/L</small><b>₹{fmt(state?.live_pnl)}</b></div>
     </section>
     {error && <div className="error">{error}</div>}
-    <section><div className="section-title"><h2>Index Model Decisions</h2><span>Independent model → option recommendation</span></div><div className="index-grid">{indices.length ? indices.map((d, i) => <IndexCard key={d?.name || i} data={d} />) : <div className="empty">Waiting for index data…</div>}</div></section>
+    <section><div className="section-title"><h2>Index Model Decisions</h2><span>NIFTY 50 · BANK NIFTY · SENSEX</span></div><div className="index-grid">{indices.length ? indices.map((d, i) => <IndexCard key={d?.name || i} data={d} />) : <div className="empty">Waiting for index data…</div>}</div></section>
     <section className="lower-grid">
       <article className="panel"><h2>Paper Position</h2>{paper ? <div className="position-grid"><div><small>SIDE</small><b>{paper.side}</b></div><div><small>QTY</small><b>{fmt0(paper.qty)}</b></div><div><small>ENTRY</small><b>₹{fmt(paper.entry)}</b></div><div><small>STOP</small><b>₹{fmt(paper.stop)}</b></div><div><small>TARGET</small><b>₹{fmt(paper.target)}</b></div><div><small>CONFIDENCE</small><b>{paper.confidence}%</b></div></div> : <p className="muted">No open paper position.</p>}<p className="event">{state?.event || 'No recent execution event.'}</p></article>
       <article className="panel"><h2>Signal Reasons</h2><ul>{(signal.reasons || []).map((r, i) => <li key={i}>{r}</li>)}</ul></article>
