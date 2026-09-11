@@ -27,3 +27,25 @@ def test_option_recommendation_uses_live_premium_as_entry():
     assert result["buy_price"] == 110
     assert result["target_price"] > 110
     assert result["stop_price"] < 110
+
+
+def test_hold_still_exposes_live_atm_snapshot():
+    chain = {
+        "source": "Dhan",
+        "expiry": "2026-09-17",
+        "rows": [
+            {"strike": 23400, "CE": {"ltp": 110, "iv": 12, "oi": 100000, "volume": 50000}, "PE": {"ltp": 95, "iv": 13, "oi": 120000, "volume": 60000}},
+        ],
+    }
+    result = build_option_recommendation(23380, "HOLD", 23380, chain)
+    assert result["available"] is True
+    assert result["mode"] == "snapshot"
+    assert result["strike"] == 23400
+    assert result["ce_premium"] == 110
+    assert result["pe_premium"] == 95
+
+
+def test_hold_without_chain_is_not_reported_as_a_trade_signal():
+    result = build_option_recommendation(23380, "HOLD", 23380, None)
+    assert result["available"] is False
+    assert "option-chain" in result["reason"].lower()
