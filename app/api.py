@@ -15,7 +15,7 @@ from app.ml_model import predict_ml_signal
 from app.option_chain import build_option_recommendation, fetch_bse_sensex_chain, fetch_nse_chain
 from app.trading import INDEX_UNIVERSE, POPULAR_STOCKS, add_indicators, position_size, score_signal
 
-app = FastAPI(title="Algo Trading Pro API", version="1.2.2")
+app = FastAPI(title="Algo Trading Pro API", version="1.2.3")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 
 INDEX_OPTION_SYMBOLS = {"NIFTY 50": "NIFTY", "BANK NIFTY": "BANKNIFTY", "SENSEX": "SENSEX"}
@@ -98,7 +98,18 @@ def option_chain_cached(name: str) -> dict[str, Any] | None:
 def model_signal(x: pd.DataFrame, symbol: str, strategy: str, threshold: float):
     technical = score_signal(x.iloc[-1], strategy, reward_r=2.0)
     if strategy != "Ensemble": return technical, None
+
     ml = predict_ml_signal(x, symbol, threshold=threshold)
+
+    # Do not turn a temporarily unavailable ML model into a fake 0% signal.
+    # Keep the independently calculated technical evidence visible and explicitly
+    # report that calibrated ML is unavailable. This prevents the UI from showing
+    # a misleading 0% confidence simply because training/calibration failed.
+    if not ml.trained:
+        technical.reasons.append(f"Calibrated ML unavailable: {ml.reason}")
+        technical.reasons.append(f"Technical evidence confidence: {technical.confidence:.1f}%")
+        return technical, ml
+
     technical.action = ml.action
     technical.confidence = ml.confidence
     if ml.action in {"BUY", "SELL"}:
@@ -154,7 +165,7 @@ def execute_paper(account: PaperAccount, x: pd.DataFrame, symbol: str, strategy:
 
 
 @app.get("/")
-def root() -> dict[str, str]: return {"service": "Algo Trading Pro API", "status": "ok", "websocket": "/ws", "version": "1.2.2"}
+def root() -> dict[str, str]: return {"service": "Algo Trading Pro API", "status": "ok", "websocket": "/ws", "version": "1.2.3"}
 
 @app.get("/health")
 def health() -> dict[str, str]: return {"status": "ok"}
