@@ -13,7 +13,7 @@ from app.news import get_news, news_confirmation
 from app.option_chain import build_option_recommendation, fetch_bse_sensex_chain, fetch_nse_chain
 from app.trading import INDEX_UNIVERSE, POPULAR_STOCKS, add_indicators, position_size, score_signal
 
-app = FastAPI(title="Algo Trading Pro API", version="1.5.0")
+app = FastAPI(title="Algo Trading Pro API", version="1.5.1")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 INDEX_OPTION_SYMBOLS = {"NIFTY 50": "NIFTY", "BANK NIFTY": "BANKNIFTY", "SENSEX": "SENSEX"}
 INDEX_DISPLAY_ORDER = ("NIFTY 50", "BANK NIFTY", "SENSEX")
@@ -68,8 +68,8 @@ def news_cached(symbol: str):
     if cached and now-cached[0]<NEWS_CACHE_TTL: return cached[1]
     value=get_news(symbol); _news_cache[symbol]=(now,value); return value
 
-def model_signal(x: pd.DataFrame, symbol: str, strategy: str, threshold: float):
-    technical=score_signal(x.iloc[-1],strategy,reward_r=2.0)
+def model_signal(x: pd.DataFrame, symbol: str, strategy: str, threshold: float, reward_r: float = 2.0):
+    technical=score_signal(x.iloc[-1],strategy,reward_r=reward_r)
     if strategy!="Ensemble": return technical,None
     ml=predict_ml_signal(x,symbol,threshold=threshold,train_if_missing=False)
     if not ml.trained:
@@ -81,47 +81,51 @@ def model_signal(x: pd.DataFrame, symbol: str, strategy: str, threshold: float):
         atr=float(x.iloc[-1].get("ATR_14",0.0))
         if not math.isfinite(atr) or atr<=0: atr=technical.entry*0.01
         risk=1.5*atr
-        if ml.action=="BUY": technical.stop,technical.target=technical.entry-risk,technical.entry+2.0*risk
-        else: technical.stop,technical.target=technical.entry+risk,technical.entry-2.0*risk
-    else: technical.stop=technical.target=float("nan")
+        if ml.action=="BUY": technical.stop,technical.target=technical.entry-risk,technical.entry+reward_r*risk
+        else: technical.stop,technical.target=technical.entry+risk,technical.entry-reward_r*risk
+        technical.risk_reward=reward_r
+    else: technical.stop=technical.target=float("nan"); technical.risk_reward=float("nan")
     technical.reasons.append(ml.reason)
     if ml.validation_accuracy is not None: technical.reasons.append(f"Training samples: {ml.samples:,} · validation accuracy: {ml.validation_accuracy*100:.1f}%")
     else: technical.reasons.append(f"Training samples: {ml.samples:,}")
     return technical,ml
 
-def index_decision(name: str,ticker: str,threshold: float):
+def sell_price_for(sig):
+    if sig.action == "BUY": return sig.target
+    if sig.action == "SELL": return sig.entry
+    return float("nan")
+
+def index_decision(name: str,ticker: str,threshold: float,reward_r: float=2.0):
     x,spot=market_snapshot(ticker)
     if x is None or spot is None: return {"name":name,"symbol":ticker,"available":False,"reason":"Live index data unavailable"}
-    sig,ml=model_signal(x,ticker,"Ensemble",threshold)
+    sig,ml=model_signal(x,ticker,"Ensemble",threshold,reward_r)
     option=build_option_recommendation(spot,sig.action,sig.target,option_chain_cached(INDEX_OPTION_SYMBOLS[name]))
-    return {"name":name,"symbol":ticker,"available":True,"price":spot,"decision":sig.action,"confidence":sig.confidence,"entry":sig.entry,"stop":sig.stop,"target":sig.target,"risk_reward":sig.risk_reward,"reasons":sig.reasons,"model":asdict(ml) if ml else None,"option":option,"timestamp":time.time()}
+    return {"name":name,"symbol":ticker,"available":True,"price":spot,"decision":sig.action,"confidence":sig.confidence,"entry":sig.entry,"stop":sig.stop,"target":sig.target,"sell_price":sell_price_for(sig),"risk_reward":sig.risk_reward,"reasons":sig.reasons,"model":asdict(ml) if ml else None,"option":option,"timestamp":time.time()}
 
-async def refresh_index(name: str, ticker: str, threshold: float) -> None:
+async def refresh_index(name: str, ticker: str, threshold: float, reward_r: float=2.0) -> None:
     async with _index_refresh_lock:
         if name in _index_refreshing: return
         _index_refreshing.add(name)
     try:
-        value=await asyncio.to_thread(index_decision,name,ticker,threshold)
+        value=await asyncio.to_thread(index_decision,name,ticker,threshold,reward_r)
         _index_cache[name]=(time.time(),value)
     finally:
         async with _index_refresh_lock:
             _index_refreshing.discard(name)
 
-async def refresh_stale_indices(threshold: float) -> None:
-    now=time.time()
-    jobs=[]
+async def refresh_stale_indices(threshold: float, reward_r: float=2.0) -> None:
+    now=time.time(); jobs=[]
     for name in INDEX_DISPLAY_ORDER:
         cached=_index_cache.get(name)
         if cached is None or now-cached[0]>=INDEX_CACHE_TTL:
-            jobs.append(asyncio.create_task(refresh_index(name,INDEX_UNIVERSE[name],threshold)))
-    if jobs:
-        await asyncio.gather(*jobs,return_exceptions=True)
+            jobs.append(asyncio.create_task(refresh_index(name,INDEX_UNIVERSE[name],threshold,reward_r)))
+    if jobs: await asyncio.gather(*jobs,return_exceptions=True)
 
 def current_indices() -> dict[str,dict[str,Any]]:
     return {name:data for name in INDEX_DISPLAY_ORDER if (cached:=_index_cache.get(name)) and (data:=cached[1])}
 
 def execute_paper(account: PaperAccount,x: pd.DataFrame, symbol: str,strategy: str,risk_pct: float,brokerage_pct: float,reward_r: float,threshold: float,strict: bool,auto: bool,news: dict[str, Any]):
-    price=float(x.iloc[-1]["Close"]); sig,ml=model_signal(x,symbol,strategy,threshold)
+    price=float(x.iloc[-1]["Close"]); sig,ml=model_signal(x,symbol,strategy,threshold,reward_r)
     news_ok,news_reason=news_confirmation(sig.action,news)
     sig.reasons.append(news_reason)
     qualified=sig.action!="HOLD" and sig.confidence>=threshold and news_ok if strict else sig.action!="HOLD" and news_ok
@@ -140,10 +144,11 @@ def execute_paper(account: PaperAccount,x: pd.DataFrame, symbol: str,strategy: s
         if qty>0:
             side="LONG" if sig.action=="BUY" else "SHORT"; fee=abs(qty*price)*brokerage_pct/100; account.cash-=fee; account.position=PaperPosition(side,qty,price,sig.stop,sig.target,time.time(),sig.confidence); event=f"PAPER {sig.action} OPEN · Qty {qty:,} · Entry ₹{price:,.2f} · News {news.get('bias','NEUTRAL')}";
     p=account.position; live_pnl=(price-p.entry)*p.qty if p and p.side=="LONG" else ((p.entry-price)*p.qty if p else 0.0)
-    return {"price":price,"signal":asdict(sig),"model":asdict(ml) if ml else None,"qualified":qualified,"position":asdict(p) if p else None,"live_pnl":live_pnl,"cash":account.cash,"realized_pnl":account.realized,"event":event,"timestamp":time.time()}
+    signal_data=asdict(sig); signal_data["sell_price"]=sell_price_for(sig)
+    return {"price":price,"signal":signal_data,"model":asdict(ml) if ml else None,"qualified":qualified,"position":asdict(p) if p else None,"live_pnl":live_pnl,"cash":account.cash,"realized_pnl":account.realized,"event":event,"timestamp":time.time()}
 
 @app.get("/")
-def root(): return {"service":"Algo Trading Pro API","status":"ok","websocket":"/ws","version":"1.5.0"}
+def root(): return {"service":"Algo Trading Pro API","status":"ok","websocket":"/ws","version":"1.5.1"}
 @app.get("/health")
 def health(): return {"status":"ok"}
 @app.get("/universe")
@@ -168,23 +173,13 @@ async def websocket_endpoint(ws: WebSocket):
             if x is None or price is None:
                 payload={"type":"error","message":"Live market data unavailable","timestamp":time.time()}
             else:
-                if config["strategy"]=="Ensemble" and not model_is_ready(config["symbol"]):
-                    asyncio.create_task(asyncio.to_thread(prewarm_ml_model,x,config["symbol"]))
+                if config["strategy"]=="Ensemble" and not model_is_ready(config["symbol"]): asyncio.create_task(asyncio.to_thread(prewarm_ml_model,x,config["symbol"]))
                 news_data=await asyncio.to_thread(news_cached,config["symbol"])
                 result=await asyncio.to_thread(execute_paper,account,x,config["symbol"],config["strategy"],float(config["risk_pct"]),float(config["brokerage_pct"]),float(config["reward_r"]),float(config["threshold"]),bool(config["strict"]),bool(config["auto"]),news_data)
                 result["type"]="tick"; result["symbol"]=config["symbol"]; result["news"]=news_data
                 await ws.send_json(_json_safe(result))
-                if not _index_cache or any(time.time()-v[0]>=INDEX_CACHE_TTL for v in _index_cache.values()):
-                    asyncio.create_task(refresh_stale_indices(float(config["threshold"])))
-                cached_indices=current_indices()
-                if cached_indices:
-                    result["indices"]=cached_indices
-                else:
-                    result["indices"]={}
-                result["timestamp"]=time.time()
-                # Send index state only when it has been refreshed; the primary
-                # tick is never blocked by slow option-chain/index providers.
-                await ws.send_json(_json_safe(result))
-                await asyncio.sleep(1.0); continue
+                if not _index_cache or any(time.time()-v[0]>=INDEX_CACHE_TTL for v in _index_cache.values()): asyncio.create_task(refresh_stale_indices(float(config["threshold"]),float(config["reward_r"])))
+                cached_indices=current_indices(); result["indices"]=cached_indices if cached_indices else {}; result["timestamp"]=time.time()
+                await ws.send_json(_json_safe(result)); await asyncio.sleep(1.0); continue
             await ws.send_json(_json_safe(payload)); await asyncio.sleep(1.0)
     except (WebSocketDisconnect,RuntimeError): accounts.pop(client_id,None)
