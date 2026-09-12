@@ -13,15 +13,20 @@ from app.news import get_news, news_confirmation
 from app.option_chain import build_option_recommendation, fetch_bse_sensex_chain, fetch_nse_chain
 from app.trading import INDEX_UNIVERSE, POPULAR_STOCKS, add_indicators, position_size, score_signal
 
-app = FastAPI(title="Algo Trading Pro API", version="1.4.1")
+app = FastAPI(title="Algo Trading Pro API", version="1.5.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 INDEX_OPTION_SYMBOLS = {"NIFTY 50": "NIFTY", "BANK NIFTY": "BANKNIFTY", "SENSEX": "SENSEX"}
 INDEX_DISPLAY_ORDER = ("NIFTY 50", "BANK NIFTY", "SENSEX")
 _option_cache: dict[str, tuple[float, dict[str, Any] | None]] = {}
 _market_cache: dict[str, tuple[float, pd.DataFrame, float]] = {}
 _news_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_index_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_index_refreshing: set[str] = set()
+_index_refresh_lock = asyncio.Lock()
 MARKET_CACHE_TTL = 5.0
 NEWS_CACHE_TTL = 180.0
+INDEX_CACHE_TTL = 15.0
+OPTION_CACHE_TTL = 30.0
 
 @dataclass
 class PaperPosition:
@@ -55,7 +60,7 @@ def market_snapshot(symbol: str):
 
 def option_chain_cached(name: str):
     now=time.time(); cached=_option_cache.get(name)
-    if cached and now-cached[0]<10: return cached[1]
+    if cached and now-cached[0]<OPTION_CACHE_TTL: return cached[1]
     chain=fetch_bse_sensex_chain() if name=="SENSEX" else fetch_nse_chain(name); _option_cache[name]=(now,chain); return chain
 
 def news_cached(symbol: str):
@@ -91,6 +96,30 @@ def index_decision(name: str,ticker: str,threshold: float):
     option=build_option_recommendation(spot,sig.action,sig.target,option_chain_cached(INDEX_OPTION_SYMBOLS[name]))
     return {"name":name,"symbol":ticker,"available":True,"price":spot,"decision":sig.action,"confidence":sig.confidence,"entry":sig.entry,"stop":sig.stop,"target":sig.target,"risk_reward":sig.risk_reward,"reasons":sig.reasons,"model":asdict(ml) if ml else None,"option":option,"timestamp":time.time()}
 
+async def refresh_index(name: str, ticker: str, threshold: float) -> None:
+    async with _index_refresh_lock:
+        if name in _index_refreshing: return
+        _index_refreshing.add(name)
+    try:
+        value=await asyncio.to_thread(index_decision,name,ticker,threshold)
+        _index_cache[name]=(time.time(),value)
+    finally:
+        async with _index_refresh_lock:
+            _index_refreshing.discard(name)
+
+async def refresh_stale_indices(threshold: float) -> None:
+    now=time.time()
+    jobs=[]
+    for name in INDEX_DISPLAY_ORDER:
+        cached=_index_cache.get(name)
+        if cached is None or now-cached[0]>=INDEX_CACHE_TTL:
+            jobs.append(asyncio.create_task(refresh_index(name,INDEX_UNIVERSE[name],threshold)))
+    if jobs:
+        await asyncio.gather(*jobs,return_exceptions=True)
+
+def current_indices() -> dict[str,dict[str,Any]]:
+    return {name:data for name in INDEX_DISPLAY_ORDER if (cached:=_index_cache.get(name)) and (data:=cached[1])}
+
 def execute_paper(account: PaperAccount,x: pd.DataFrame, symbol: str,strategy: str,risk_pct: float,brokerage_pct: float,reward_r: float,threshold: float,strict: bool,auto: bool,news: dict[str, Any]):
     price=float(x.iloc[-1]["Close"]); sig,ml=model_signal(x,symbol,strategy,threshold)
     news_ok,news_reason=news_confirmation(sig.action,news)
@@ -114,7 +143,7 @@ def execute_paper(account: PaperAccount,x: pd.DataFrame, symbol: str,strategy: s
     return {"price":price,"signal":asdict(sig),"model":asdict(ml) if ml else None,"qualified":qualified,"position":asdict(p) if p else None,"live_pnl":live_pnl,"cash":account.cash,"realized_pnl":account.realized,"event":event,"timestamp":time.time()}
 
 @app.get("/")
-def root(): return {"service":"Algo Trading Pro API","status":"ok","websocket":"/ws","version":"1.4.1"}
+def root(): return {"service":"Algo Trading Pro API","status":"ok","websocket":"/ws","version":"1.5.0"}
 @app.get("/health")
 def health(): return {"status":"ok"}
 @app.get("/universe")
@@ -145,14 +174,16 @@ async def websocket_endpoint(ws: WebSocket):
                 result=await asyncio.to_thread(execute_paper,account,x,config["symbol"],config["strategy"],float(config["risk_pct"]),float(config["brokerage_pct"]),float(config["reward_r"]),float(config["threshold"]),bool(config["strict"]),bool(config["auto"]),news_data)
                 result["type"]="tick"; result["symbol"]=config["symbol"]; result["news"]=news_data
                 await ws.send_json(_json_safe(result))
-                async def load_indices():
-                    jobs=[asyncio.to_thread(index_decision,name,INDEX_UNIVERSE[name],float(config["threshold"])) for name in INDEX_DISPLAY_ORDER]
-                    return dict(zip(INDEX_DISPLAY_ORDER,await asyncio.gather(*jobs,return_exceptions=False)))
-                try:
-                    result["indices"]=await asyncio.wait_for(load_indices(),timeout=8.0)
-                except (asyncio.TimeoutError,Exception):
+                if not _index_cache or any(time.time()-v[0]>=INDEX_CACHE_TTL for v in _index_cache.values()):
+                    asyncio.create_task(refresh_stale_indices(float(config["threshold"])))
+                cached_indices=current_indices()
+                if cached_indices:
+                    result["indices"]=cached_indices
+                else:
                     result["indices"]={}
                 result["timestamp"]=time.time()
+                # Send index state only when it has been refreshed; the primary
+                # tick is never blocked by slow option-chain/index providers.
                 await ws.send_json(_json_safe(result))
                 await asyncio.sleep(1.0); continue
             await ws.send_json(_json_safe(payload)); await asyncio.sleep(1.0)
