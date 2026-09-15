@@ -1,7 +1,6 @@
 from __future__ import annotations
 import threading, time
 from dataclasses import dataclass
-from typing import Any
 import numpy as np, pandas as pd, requests
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier, VotingClassifier
@@ -11,13 +10,13 @@ from app.trading import add_indicators
 
 FEATURES=["RSI_14","MACD","MACD_HIST","ATR_PCT","BB_WIDTH","VWAP_DIST","ROC_12","RET_1","RET_5","RET_20","ADX_14","STOCH_K","STOCH_D","CCI_20","EMA9_21","EMA21_50","VOLUME_RATIO"]
 MODEL_TTL_SECONDS=600
-MODEL_FAILURE_BACKOFF_SECONDS=300
+MODEL_FAILURE_BACKOFF_SECONDS=60
 MODEL_THRESHOLD_DEFAULT=95.0
-MODEL_MIN_SAMPLES=200
+MODEL_MIN_SAMPLES=100
 TRAIN_PERIOD_SECONDS=10*86400
-_MODEL_CACHE:dict[str,tuple[float,Any,dict[str,Any]]]={}
+_MODEL_CACHE={}
 _MODEL_LOCK=threading.Lock()
-_TRAINING_SYMBOLS:set[str]=set()
+_TRAINING_SYMBOLS=set()
 
 @dataclass
 class MLSignal:
@@ -33,21 +32,21 @@ def _prepare_features(df):
     return x.replace([np.inf,-np.inf],np.nan)
 
 def _training_set(df):
-    x=_prepare_features(df); close=pd.to_numeric(x["Close"],errors="coerce"); future_return=close.shift(-3)/close-1.0; volatility=close.pct_change().rolling(30).std()
-    adaptive=(volatility*3.0*0.75).clip(lower=0.0006,upper=0.0035)
+    x=_prepare_features(df); close=pd.to_numeric(x["Close"],errors="coerce"); future_return=close.shift(-3)/close-1.0; volatility=close.pct_change().rolling(20).std()
+    adaptive=(volatility*2.5*0.75).clip(lower=0.0004,upper=0.003)
     y=pd.Series(np.nan,index=x.index,dtype=float); y.loc[future_return>adaptive]=1.0; y.loc[future_return<-adaptive]=0.0
     data=x[FEATURES].copy(); mask=data.notna().all(axis=1)&y.notna(); X,y=data.loc[mask],y.loc[mask].astype(int)
-    if len(y) and (y.nunique()<2 or y.value_counts(normalize=True).min()<0.05):
-        fallback=pd.Series(np.nan,index=x.index,dtype=float); fallback.loc[future_return>0.0005]=1.0; fallback.loc[future_return<-0.0005]=0.0
+    if len(y)<MODEL_MIN_SAMPLES or y.nunique()<2 or y.value_counts(normalize=True).min()<0.05:
+        fallback=pd.Series(np.nan,index=x.index,dtype=float); fallback.loc[future_return>0.0004]=1.0; fallback.loc[future_return<-0.0004]=0.0
         mask=data.notna().all(axis=1)&fallback.notna(); X,y=data.loc[mask],fallback.loc[mask].astype(int)
-    if len(y) and y.nunique()<2:
+    if len(y)<MODEL_MIN_SAMPLES or y.nunique()<2:
         fallback=(future_return>0).astype(float).where(future_return.notna()); mask=data.notna().all(axis=1)&fallback.notna(); X,y=data.loc[mask],fallback.loc[mask].astype(int)
     return X,y
 
 def _fetch_training_frame(symbol):
     now=int(time.time()); url=f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"; params={"period1":now-TRAIN_PERIOD_SECONDS,"period2":now+5,"interval":"5m","includePrePost":"true","events":"div,splits","_":str(now)}
     try:
-        r=requests.get(url,params=params,headers={"Cache-Control":"no-cache","Pragma":"no-cache","User-Agent":"Mozilla/5.0"},timeout=12); r.raise_for_status(); result=(r.json().get("chart",{}).get("result") or [None])[0]
+        r=requests.get(url,params=params,headers={"Cache-Control":"no-cache","Pragma":"no-cache","User-Agent":"Mozilla/5.0"},timeout=8); r.raise_for_status(); result=(r.json().get("chart",{}).get("result") or [None])[0]
         if not result:return pd.DataFrame()
         ts=result.get("timestamp",[]); q=(result.get("indicators",{}).get("quote") or [{}])[0]
         if not ts:return pd.DataFrame()
@@ -55,40 +54,45 @@ def _fetch_training_frame(symbol):
     except Exception:return pd.DataFrame()
 
 def _make_base():
-    rf=RandomForestClassifier(n_estimators=50,max_depth=8,min_samples_leaf=6,class_weight="balanced_subsample",random_state=42,n_jobs=1)
-    hgb=HistGradientBoostingClassifier(max_iter=60,learning_rate=0.05,max_leaf_nodes=12,l2_regularization=1.0,random_state=42)
+    rf=RandomForestClassifier(n_estimators=30,max_depth=7,min_samples_leaf=4,class_weight="balanced_subsample",random_state=42,n_jobs=1)
+    hgb=HistGradientBoostingClassifier(max_iter=35,learning_rate=0.06,max_leaf_nodes=10,l2_regularization=1.0,random_state=42)
     return VotingClassifier(estimators=[("rf",rf),("hgb",hgb)],voting="soft",weights=[1.0,1.2],n_jobs=1), "RandomForest + HistGradientBoosting"
 
 def _calibrated_model(base,X,y):
-    if y.nunique()<2 or y.value_counts().min()<3:return None
+    if y.nunique()<2 or y.value_counts().min()<2:return None
     folds=min(2,int(y.value_counts().min()))
     if folds<2:return None
     splitter=StratifiedKFold(n_splits=folds,shuffle=True,random_state=42)
-    model=CalibratedClassifierCV(estimator=base,method="sigmoid",cv=splitter,ensemble=False); model.fit(X,y); return model
+    return CalibratedClassifierCV(estimator=base,method="sigmoid",cv=splitter,ensemble=False).fit(X,y)
 
 def _fit(df,symbol):
-    training=_fetch_training_frame(symbol)
-    if len(training)<800:
-        # Yahoo may return a short 5-minute window. Reuse the already fetched
-        # live 1-minute bars and resample them to 5-minute bars instead of
-        # training on an undersized raw frame.
-        training=df[["Open","High","Low","Close","Volume"]].copy()
-        training=training.dropna(subset=["Open","High","Low","Close"])
+    started=time.time(); training=_fetch_training_frame(symbol)
+    if len(training)<120:
+        training=df[["Open","High","Low","Close","Volume"]].copy().dropna(subset=["Open","High","Low","Close"])
         if len(training)>=30:
             training=training.resample("5min").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna(subset=["Open","High","Low","Close"])
     if training.empty:return None,{"samples":0,"validation_accuracy":None,"reason":"No training data was returned.","engine":"Unavailable"}
     X,y=_training_set(add_indicators(training))
     if len(X)<MODEL_MIN_SAMPLES or y.nunique()<2:return None,{"samples":int(len(X)),"validation_accuracy":None,"reason":f"Training set has {len(X)} rows and {y.nunique()} classes.","engine":"Not ready"}
-    split=int(len(X)*0.80); X_train,X_test=X.iloc[:split],X.iloc[split:]; y_train,y_test=y.iloc[:split],y.iloc[split:]
-    if y_train.nunique()<2 or y_test.nunique()<2:return None,{"samples":int(len(X)),"validation_accuracy":None,"reason":"Chronological validation window contains only one class.","engine":"Not ready"}
+    split=max(40,int(len(X)*0.80)); split=min(split,len(X)-20); X_train,X_test=X.iloc[:split],X.iloc[split:]; y_train,y_test=y.iloc[:split],y.iloc[split:]
+    if y_train.nunique()<2 or y_test.nunique()<2:
+        # Retry with a smaller holdout so short live histories can still be validated.
+        split=max(30,int(len(X)*0.70)); split=min(split,len(X)-15); X_train,X_test=X.iloc[:split],X.iloc[split:]; y_train,y_test=y.iloc[:split],y.iloc[split:]
+    if y_train.nunique()<2 or y_test.nunique()<2:return None,{"samples":int(len(X)),"validation_accuracy":None,"reason":"Validation window contains only one class.","engine":"Not ready"}
     base,engine=_make_base()
     try:
-        vm=_calibrated_model(base,X_train,y_train)
-        if vm is None:return None,{"samples":int(len(X)),"validation_accuracy":None,"reason":"Calibration training window has insufficient class diversity.","engine":engine}
-        acc=float(balanced_accuracy_score(y_test,vm.predict(X_test))); fm=_calibrated_model(base,X,y)
-        if fm is None:return None,{"samples":int(len(X)),"validation_accuracy":acc,"reason":"Final calibration window has insufficient class diversity.","engine":engine}
-    except (ValueError,RuntimeError,TypeError) as exc:return None,{"samples":int(len(X)),"validation_accuracy":None,"reason":f"Calibration failed: {type(exc).__name__}.","engine":engine}
-    return fm,{"samples":int(len(X)),"validation_accuracy":acc,"reason":"Calibrated model ready.","engine":engine}
+        base.fit(X_train,y_train); acc=float(balanced_accuracy_score(y_test,base.predict(X_test)))
+        try:
+            model=_calibrated_model(_make_base()[0],X_train,y_train); final_engine="Calibrated " + engine
+            if model is None: raise ValueError("calibration unavailable")
+        except (ValueError,RuntimeError,TypeError):
+            model=_make_base()[0].fit(X,y); final_engine=engine + " probability fallback"
+        meta={"samples":int(len(X)),"validation_accuracy":acc,"reason":"ML model ready.","engine":final_engine,"trained_seconds":round(time.time()-started,2)}
+        print(f"ML_READY symbol={symbol} samples={len(X)} accuracy={acc:.3f} seconds={time.time()-started:.2f}")
+        return model,meta
+    except (ValueError,RuntimeError,TypeError) as exc:
+        print(f"ML_TRAIN_FAILED symbol={symbol} error={type(exc).__name__}")
+        return None,{"samples":int(len(X)),"validation_accuracy":None,"reason":f"Training failed: {type(exc).__name__}.","engine":engine}
 
 def _prediction_frame(df):
     x=df[["Open","High","Low","Close","Volume"]].copy()
@@ -123,13 +127,13 @@ def predict_ml_signal(df,symbol,threshold=MODEL_THRESHOLD_DEFAULT,train_if_missi
     with _MODEL_LOCK:
         cached=_MODEL_CACHE.get(symbol)
         if cached and now-cached[0]<MODEL_TTL_SECONDS:model,meta=cached[1],cached[2]
-        elif cached and cached[1] is None and now-cached[0]<MODEL_FAILURE_BACKOFF_SECONDS:return MLSignal("HOLD",0.0,False,int(cached[2].get("samples",0)),cached[2].get("validation_accuracy"),threshold,cached[2].get("reason","Model training is temporarily backed off after a failed attempt."))
+        elif cached and cached[1] is None and now-cached[0]<MODEL_FAILURE_BACKOFF_SECONDS:return MLSignal("HOLD",0.0,False,int(cached[2].get("samples",0)),cached[2].get("validation_accuracy"),threshold,cached[2].get("reason","Model training is temporarily backed off."))
         elif not train_if_missing:return MLSignal("HOLD",0.0,False,0,None,threshold,"Model is training in the background.")
         else:model=None; meta=None
     if model is None:
         model,meta=_fit(df,symbol)
         with _MODEL_LOCK:_MODEL_CACHE[symbol]=(time.time(),model,meta)
-    if model is None:return MLSignal("HOLD",0.0,False,int(meta.get("samples",0)),meta.get("validation_accuracy"),threshold,meta.get("reason","Model did not meet minimum data/calibration requirements."))
+    if model is None:return MLSignal("HOLD",0.0,False,int(meta.get("samples",0)),meta.get("validation_accuracy"),threshold,meta.get("reason","Model did not meet minimum requirements."))
     prediction_df=_prediction_frame(df)
     if prediction_df.empty:return MLSignal("HOLD",0.0,True,int(meta["samples"]),meta.get("validation_accuracy"),threshold,"Live prediction timeframe is incomplete.")
     features=_prepare_features(prediction_df)[FEATURES]; complete=features.dropna(how="any")
@@ -139,7 +143,7 @@ def predict_ml_signal(df,symbol,threshold=MODEL_THRESHOLD_DEFAULT,train_if_missi
     if p_up>=threshold/100.0 and p_up>p_down:action="BUY"
     elif p_down>=threshold/100.0 and p_down>p_up:action="SELL"
     else:action="HOLD"
-    engine=meta.get("engine","Calibrated ensemble")
-    reason=f"{engine} calibrated probability {confidence:.1f}% {'reached' if action!='HOLD' else 'is below'} the {threshold:.1f}% trade threshold."
+    engine=meta.get("engine","ML ensemble")
+    reason=f"{engine} probability {confidence:.1f}% {'reached' if action!='HOLD' else 'is below'} the {threshold:.1f}% trade threshold."
     if latest_complete_index!=latest_index:reason+=" Latest 5-minute bar was incomplete, so the last complete bar was used."
     return MLSignal(action,confidence,True,int(meta["samples"]),meta.get("validation_accuracy"),threshold,reason)
