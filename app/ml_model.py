@@ -9,17 +9,12 @@ from sklearn.metrics import balanced_accuracy_score
 from sklearn.model_selection import StratifiedKFold
 from app.trading import add_indicators
 
-try:
-    from xgboost import XGBClassifier
-except Exception:
-    XGBClassifier = None
-
 FEATURES=["RSI_14","MACD","MACD_HIST","ATR_PCT","BB_WIDTH","VWAP_DIST","ROC_12","RET_1","RET_5","RET_20","ADX_14","STOCH_K","STOCH_D","CCI_20","EMA9_21","EMA21_50","VOLUME_RATIO"]
 MODEL_TTL_SECONDS=600
 MODEL_FAILURE_BACKOFF_SECONDS=300
 MODEL_THRESHOLD_DEFAULT=95.0
-MODEL_MIN_SAMPLES=700
-TRAIN_PERIOD_SECONDS=30*86400
+MODEL_MIN_SAMPLES=500
+TRAIN_PERIOD_SECONDS=10*86400
 _MODEL_CACHE:dict[str,tuple[float,Any,dict[str,Any]]]={}
 _MODEL_LOCK=threading.Lock()
 _TRAINING_SYMBOLS:set[str]=set()
@@ -60,23 +55,20 @@ def _fetch_training_frame(symbol):
     except Exception:return pd.DataFrame()
 
 def _make_base():
-    rf=RandomForestClassifier(n_estimators=80,max_depth=9,min_samples_leaf=6,class_weight="balanced_subsample",random_state=42,n_jobs=1)
-    if XGBClassifier is not None:
-        xgb=XGBClassifier(n_estimators=100,max_depth=4,learning_rate=0.04,subsample=0.85,colsample_bytree=0.85,min_child_weight=4,reg_lambda=2.0,objective="binary:logistic",eval_metric="logloss",tree_method="hist",n_jobs=1,random_state=42)
-        return VotingClassifier(estimators=[("rf",rf),("xgb",xgb)],voting="soft",weights=[1.0,1.4],n_jobs=1), "RandomForest + XGBoost"
-    hgb=HistGradientBoostingClassifier(max_iter=90,learning_rate=0.04,max_leaf_nodes=15,l2_regularization=1.0,random_state=42)
-    return VotingClassifier(estimators=[("rf",rf),("hgb",hgb)],voting="soft",weights=[1.0,1.3],n_jobs=1), "RandomForest + HistGradientBoosting"
+    rf=RandomForestClassifier(n_estimators=50,max_depth=8,min_samples_leaf=6,class_weight="balanced_subsample",random_state=42,n_jobs=1)
+    hgb=HistGradientBoostingClassifier(max_iter=60,learning_rate=0.05,max_leaf_nodes=12,l2_regularization=1.0,random_state=42)
+    return VotingClassifier(estimators=[("rf",rf),("hgb",hgb)],voting="soft",weights=[1.0,1.2],n_jobs=1), "RandomForest + HistGradientBoosting"
 
 def _calibrated_model(base,X,y):
     if y.nunique()<2 or y.value_counts().min()<3:return None
     folds=min(2,int(y.value_counts().min()))
     if folds<2:return None
     splitter=StratifiedKFold(n_splits=folds,shuffle=True,random_state=42)
-    model=CalibratedClassifierCV(estimator=base,method="sigmoid",cv=splitter,ensemble=True); model.fit(X,y); return model
+    model=CalibratedClassifierCV(estimator=base,method="sigmoid",cv=splitter,ensemble=False); model.fit(X,y); return model
 
 def _fit(df,symbol):
     training=_fetch_training_frame(symbol)
-    if len(training)<1000:training=df.copy()
+    if len(training)<800:training=df.copy()
     if training.empty:return None,{"samples":0,"validation_accuracy":None,"reason":"No training data was returned.","engine":"Unavailable"}
     X,y=_training_set(add_indicators(training))
     if len(X)<MODEL_MIN_SAMPLES or y.nunique()<2:return None,{"samples":int(len(X)),"validation_accuracy":None,"reason":f"Training set has {len(X)} rows and {y.nunique()} classes.","engine":"Not ready"}
