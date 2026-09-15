@@ -19,8 +19,6 @@ MODEL_TTL_SECONDS=600
 MODEL_FAILURE_BACKOFF_SECONDS=300
 MODEL_THRESHOLD_DEFAULT=95.0
 MODEL_MIN_SAMPLES=700
-# Yahoo intraday 5-minute history is limited; 30 days is enough to exceed the
-# minimum training set while keeping Render's free CPU responsive.
 TRAIN_PERIOD_SECONDS=30*86400
 _MODEL_CACHE:dict[str,tuple[float,Any,dict[str,Any]]]={}
 _MODEL_LOCK=threading.Lock()
@@ -35,7 +33,7 @@ def _prepare_features(df):
     x["ATR_PCT"]=pd.to_numeric(x.get("ATR_14"),errors="coerce")/close.replace(0,np.nan)*100
     x["VWAP_DIST"]=(close-pd.to_numeric(x.get("VWAP"),errors="coerce"))/close.replace(0,np.nan)*100
     x["EMA9_21"]=(pd.to_numeric(x.get("EMA_9"),errors="coerce")/pd.to_numeric(x.get("EMA_21"),errors="coerce")-1)*100
-    x["EMA21_50"]=(pd.to_numeric(x.get("EMA_21",errors="coerce"))/pd.to_numeric(x.get("EMA_50"),errors="coerce")-1)*100
+    x["EMA21_50"]=(pd.to_numeric(x.get("EMA_21"),errors="coerce")/pd.to_numeric(x.get("EMA_50"),errors="coerce")-1)*100
     volume_sma=pd.to_numeric(x.get("VOLUME_SMA_20"),errors="coerce"); x["VOLUME_RATIO"]=volume/volume_sma.replace(0,np.nan)
     return x.replace([np.inf,-np.inf],np.nan)
 
