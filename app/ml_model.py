@@ -13,7 +13,7 @@ FEATURES=["RSI_14","MACD","MACD_HIST","ATR_PCT","BB_WIDTH","VWAP_DIST","ROC_12",
 MODEL_TTL_SECONDS=600
 MODEL_FAILURE_BACKOFF_SECONDS=300
 MODEL_THRESHOLD_DEFAULT=95.0
-MODEL_MIN_SAMPLES=500
+MODEL_MIN_SAMPLES=200
 TRAIN_PERIOD_SECONDS=10*86400
 _MODEL_CACHE:dict[str,tuple[float,Any,dict[str,Any]]]={}
 _MODEL_LOCK=threading.Lock()
@@ -68,7 +68,14 @@ def _calibrated_model(base,X,y):
 
 def _fit(df,symbol):
     training=_fetch_training_frame(symbol)
-    if len(training)<800:training=df.copy()
+    if len(training)<800:
+        # Yahoo may return a short 5-minute window. Reuse the already fetched
+        # live 1-minute bars and resample them to 5-minute bars instead of
+        # training on an undersized raw frame.
+        training=df[["Open","High","Low","Close","Volume"]].copy()
+        training=training.dropna(subset=["Open","High","Low","Close"])
+        if len(training)>=30:
+            training=training.resample("5min").agg({"Open":"first","High":"max","Low":"min","Close":"last","Volume":"sum"}).dropna(subset=["Open","High","Low","Close"])
     if training.empty:return None,{"samples":0,"validation_accuracy":None,"reason":"No training data was returned.","engine":"Unavailable"}
     X,y=_training_set(add_indicators(training))
     if len(X)<MODEL_MIN_SAMPLES or y.nunique()<2:return None,{"samples":int(len(X)),"validation_accuracy":None,"reason":f"Training set has {len(X)} rows and {y.nunique()} classes.","engine":"Not ready"}
