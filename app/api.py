@@ -13,7 +13,7 @@ from app.news import get_news, news_confirmation
 from app.option_chain import build_option_recommendation, fetch_bse_sensex_chain, fetch_nse_chain
 from app.trading import INDEX_UNIVERSE, POPULAR_STOCKS, add_indicators, position_size, score_signal
 
-app = FastAPI(title="Algo Trading Pro API", version="1.7.0")
+app = FastAPI(title="Algo Trading Pro API", version="1.8.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 INDEX_OPTION_SYMBOLS = {"NIFTY 50": "NIFTY", "BANK NIFTY": "BANKNIFTY", "SENSEX": "SENSEX"}
 INDEX_DISPLAY_ORDER = ("NIFTY 50", "BANK NIFTY", "SENSEX")
@@ -47,13 +47,11 @@ class PaperAccount:
         self.position = None
         self.realized = 0.0
         self.last_event = ""
-        self.last_action_key = ""
     def reset(self, capital: float) -> None:
         self.cash = float(capital)
         self.position = None
         self.realized = 0.0
         self.last_event = ""
-        self.last_action_key = ""
 
 accounts: dict[str, PaperAccount] = {}
 def account_for(client_id: str, capital: float = 100000.0) -> PaperAccount:
@@ -154,7 +152,48 @@ async def refresh_stale_indices(threshold: float, reward_r: float = 2.0) -> None
 def current_indices() -> dict[str, dict[str, Any]]:
     return {name: data for name in INDEX_DISPLAY_ORDER if (cached := _index_cache.get(name)) and (data := cached[1])}
 
-def execute_paper(account: PaperAccount, x: pd.DataFrame, symbol: str, strategy: str, risk_pct: float, brokerage_pct: float, reward_r: float, threshold: float, strict: bool, auto: bool, news: dict[str, Any]):
+def _open_manual_position(account: PaperAccount, x: pd.DataFrame, symbol: str, action: str, risk_pct: float, brokerage_pct: float, reward_r: float) -> str:
+    price = float(x.iloc[-1]["Close"])
+    row = x.iloc[-1]
+    atr = float(row.get("ATR_14", 0.0))
+    if not math.isfinite(atr) or atr <= 0: atr = max(price * 0.01, 0.01)
+    risk = 1.5 * atr
+    stop = price - risk if action == "BUY" else price + risk
+    target = price + reward_r * risk if action == "BUY" else price - reward_r * risk
+    if account.position is not None:
+        p = account.position
+        pnl = (price - p.entry) * p.qty if p.side == "LONG" else (p.entry - price) * p.qty
+        fee = abs(p.qty * price) * brokerage_pct / 100
+        account.realized += pnl - fee
+        account.cash += pnl - fee
+        account.last_event = f"{p.action} {p.symbol} CLOSED · MANUAL FLIP · P/L ₹{pnl - fee:,.2f}"
+        account.position = None
+    qty = position_size(account.cash, risk_pct, price, stop)
+    if qty <= 0:
+        account.last_event = f"MANUAL {action} rejected · calculated quantity is 0"
+        return account.last_event
+    fee = abs(qty * price) * brokerage_pct / 100
+    account.cash -= fee
+    side = "LONG" if action == "BUY" else "SHORT"
+    account.position = PaperPosition(symbol, action, side, qty, price, stop, target, time.time(), 100.0)
+    verb = "BOUGHT" if action == "BUY" else "SHORT SOLD"
+    account.last_event = f"PAPER {verb} {symbol} · Qty {qty:,} · Entry ₹{price:,.2f} · Stop ₹{stop:,.2f} · Target ₹{target:,.2f}"
+    return account.last_event
+
+def _close_manual_position(account: PaperAccount, price: float, brokerage_pct: float) -> str:
+    if account.position is None:
+        account.last_event = "PAPER CLOSE ignored · no open position"
+        return account.last_event
+    p = account.position
+    pnl = (price - p.entry) * p.qty if p.side == "LONG" else (p.entry - price) * p.qty
+    fee = abs(p.qty * price) * brokerage_pct / 100
+    account.realized += pnl - fee
+    account.cash += pnl - fee
+    account.position = None
+    account.last_event = f"{p.action} {p.symbol} CLOSED · MANUAL CLOSE · P/L ₹{pnl - fee:,.2f}"
+    return account.last_event
+
+def execute_paper(account: PaperAccount, x: pd.DataFrame, symbol: str, strategy: str, risk_pct: float, brokerage_pct: float, reward_r: float, threshold: float, strict: bool, auto: bool, news: dict[str, Any], paper_command: str = ""):
     symbol = resolve_symbol(symbol)
     price = float(x.iloc[-1]["Close"]); sig, ml = model_signal(x, symbol, strategy, threshold, reward_r)
     news_ok, news_reason = news_confirmation(sig.action, news); sig.reasons.append(news_reason)
@@ -163,8 +202,15 @@ def execute_paper(account: PaperAccount, x: pd.DataFrame, symbol: str, strategy:
         qualified = sig.action != "HOLD" and news_ok and ((sig.confidence >= threshold) if ml_ready else strategy != "Ensemble")
     else:
         qualified = sig.action != "HOLD" and news_ok
+    execution_reason = "AUTO PAPER is OFF." if not auto else "Waiting for a qualified BUY/SELL signal."
     event = ""
-    if account.position:
+    if paper_command in {"BUY", "SELL"}:
+        event = _open_manual_position(account, x, symbol, paper_command, risk_pct, brokerage_pct, reward_r)
+        execution_reason = "Manual paper order executed."
+    elif paper_command == "CLOSE":
+        event = _close_manual_position(account, price, brokerage_pct)
+        execution_reason = "Manual paper close executed."
+    elif account.position:
         p = account.position; pnl = (price - p.entry) * p.qty if p.side == "LONG" else (p.entry - price) * p.qty; exit_reason = None
         if p.side == "LONG" and price <= p.stop: exit_reason = "STOP"
         elif p.side == "LONG" and price >= p.target: exit_reason = "TARGET"
@@ -173,19 +219,30 @@ def execute_paper(account: PaperAccount, x: pd.DataFrame, symbol: str, strategy:
         elif (p.side == "LONG" and sig.action == "SELL") or (p.side == "SHORT" and sig.action == "BUY"): exit_reason = "SIGNAL FLIP"
         if exit_reason:
             fee = abs(p.qty * price) * brokerage_pct / 100; account.realized += pnl - fee; account.cash += pnl - fee; event = f"{p.action} {p.symbol} CLOSED · {exit_reason} · P/L ₹{pnl - fee:,.2f}"; account.position = None
-    if account.position is None and auto and qualified and sig.action in {"BUY", "SELL"}:
+            execution_reason = f"Existing position closed by {exit_reason}."
+    if account.position is None and auto and qualified and sig.action in {"BUY", "SELL"} and not paper_command:
         qty = position_size(account.cash, risk_pct, price, sig.stop)
         if qty > 0:
             side = "LONG" if sig.action == "BUY" else "SHORT"; fee = abs(qty * price) * brokerage_pct / 100; account.cash -= fee
             account.position = PaperPosition(symbol, sig.action, side, qty, price, sig.stop, sig.target, time.time(), sig.confidence)
             verb = "BOUGHT" if sig.action == "BUY" else "SHORT SOLD"
             event = f"PAPER {verb} {symbol} · Qty {qty:,} · Entry ₹{price:,.2f} · Stop ₹{sig.stop:,.2f} · Target ₹{sig.target:,.2f}"
+            execution_reason = "AUTO PAPER opened a qualified position."
+        else:
+            execution_reason = "Signal qualified but calculated position size is 0."
+    elif auto and not qualified and not account.position and not paper_command:
+        reasons = []
+        if sig.action == "HOLD": reasons.append("signal is HOLD")
+        if not news_ok: reasons.append("news confirmation blocked it")
+        if strict and not ml_ready and strategy == "Ensemble": reasons.append("ML not ready under strict mode")
+        if strict and ml_ready and sig.confidence < threshold: reasons.append(f"confidence {sig.confidence:.1f}% < {threshold:.1f}%")
+        execution_reason = "AUTO PAPER waiting: " + (", ".join(reasons) if reasons else "qualification not met")
     p = account.position; live_pnl = (price - p.entry) * p.qty if p and p.side == "LONG" else ((p.entry - price) * p.qty if p else 0.0)
     signal_data = asdict(sig); signal_data["exit_price"] = exit_price_for(sig); signal_data["sell_price"] = sell_price_for(sig)
-    return {"price": price, "signal": signal_data, "model": asdict(ml) if ml else None, "qualified": qualified, "position": asdict(p) if p else None, "live_pnl": live_pnl, "cash": account.cash, "realized_pnl": account.realized, "event": event, "timestamp": time.time()}
+    return {"price": price, "signal": signal_data, "model": asdict(ml) if ml else None, "qualified": qualified, "position": asdict(p) if p else None, "live_pnl": live_pnl, "cash": account.cash, "realized_pnl": account.realized, "event": event or account.last_event, "execution_reason": execution_reason, "timestamp": time.time()}
 
 @app.get("/")
-def root(): return {"service": "Algo Trading Pro API", "status": "ok", "websocket": "/ws", "version": "1.7.0"}
+def root(): return {"service": "Algo Trading Pro API", "status": "ok", "websocket": "/ws", "version": "1.8.0"}
 @app.get("/health")
 def health(): return {"status": "ok"}
 @app.get("/universe")
@@ -196,7 +253,7 @@ def news(symbol: str = "RELIANCE.NS"): return _json_safe(news_cached(symbol.uppe
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept(); client_id = ws.query_params.get("client_id") or str(id(ws)); account = account_for(client_id)
-    config = {"symbol": "RELIANCE.NS", "strategy": "Ensemble", "risk_pct": 1.0, "brokerage_pct": 0.03, "reward_r": 2.0, "threshold": 95.0, "strict": False, "auto": True, "capital": 100000.0}
+    config = {"symbol": "RELIANCE.NS", "strategy": "Ensemble", "risk_pct": 1.0, "brokerage_pct": 0.03, "reward_r": 2.0, "threshold": 95.0, "strict": False, "auto": True, "capital": 100000.0, "paper_command": ""}
     try:
         while True:
             try:
@@ -213,7 +270,9 @@ async def websocket_endpoint(ws: WebSocket):
             else:
                 if config["strategy"] == "Ensemble" and not model_is_ready(resolved_symbol): asyncio.create_task(asyncio.to_thread(prewarm_ml_model, x, resolved_symbol))
                 news_data = await asyncio.to_thread(news_cached, resolved_symbol)
-                result = await asyncio.to_thread(execute_paper, account, x, resolved_symbol, config["strategy"], float(config["risk_pct"]), float(config["brokerage_pct"]), float(config["reward_r"]), float(config["threshold"]), bool(config["strict"]), bool(config["auto"]), news_data)
+                command = str(config.get("paper_command") or "")
+                result = await asyncio.to_thread(execute_paper, account, x, resolved_symbol, config["strategy"], float(config["risk_pct"]), float(config["brokerage_pct"]), float(config["reward_r"]), float(config["threshold"]), bool(config["strict"]), bool(config["auto"]), news_data, command)
+                config["paper_command"] = ""
                 result["type"] = "tick"; result["symbol"] = resolved_symbol; result["display_symbol"] = requested_symbol; result["news"] = news_data
                 await ws.send_json(_json_safe(result))
                 if not _index_cache or any(time.time() - v[0] >= INDEX_CACHE_TTL for v in _index_cache.values()): asyncio.create_task(refresh_stale_indices(float(config["threshold"]), float(config["reward_r"])))
