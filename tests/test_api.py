@@ -1,4 +1,4 @@
-from app.api import app, health, root
+from app.api import app, health, resolve_symbol, root
 from app.option_chain import build_option_recommendation
 
 
@@ -11,6 +11,13 @@ def test_api_root_advertises_websocket():
     assert payload["status"] == "ok"
     assert payload["websocket"] == "/ws"
     assert any(getattr(route, "path", None) == "/ws" for route in app.routes)
+
+
+def test_watch_aliases_resolve_to_real_yahoo_symbols():
+    assert resolve_symbol("NIFTY 50") == "^NSEI"
+    assert resolve_symbol("BANK NIFTY") == "^NSEBANK"
+    assert resolve_symbol("SENSEX") == "^BSESN"
+    assert resolve_symbol("RELIANCE") == "RELIANCE.NS"
 
 
 def test_option_recommendation_uses_live_premium_as_entry():
