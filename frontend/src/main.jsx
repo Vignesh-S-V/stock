@@ -3,67 +3,100 @@ import { createRoot } from 'react-dom/client'
 import './styles.css'
 
 const API = import.meta.env.VITE_API_URL || 'https://stock-algo-trading-api.onrender.com'
-const STRATEGIES = ['Ensemble', 'EMA Crossover', 'RSI Reversion', 'MACD', 'Trend Momentum', 'Mean Reversion']
-const SYMBOL_ALIASES = { 'NIFTY 50': '^NSEI', 'BANK NIFTY': '^NSEBANK', SENSEX: '^BSESN', RELIANCE: 'RELIANCE.NS', TCS: 'TCS.NS', INFY: 'INFY.NS', 'HDFC BANK': 'HDFCBANK.NS', 'ICICI BANK': 'ICICIBANK.NS', SBIN: 'SBIN.NS', ITC: 'ITC.NS', LT: 'LT.NS', 'BHARTI AIRTEL': 'BHARTIARTL.NS', 'AXIS BANK': 'AXISBANK.NS' }
-const DEFAULTS = { strategy: 'Ensemble', risk_pct: 1, brokerage_pct: 0.03, reward_r: 2, threshold: 95, strict: false, auto: true, capital: 100000, paper_command: '' }
+const INDEXES = ['NIFTY 50', 'BANK NIFTY', 'SENSEX']
+const SYMBOL_ALIASES = { 'NIFTY 50': '^NSEI', 'BANK NIFTY': '^NSEBANK', SENSEX: '^BSESN' }
+const DEFAULTS = { strategy: 'Ensemble', risk_pct: 1, brokerage_pct: 0.03, reward_r: 2, threshold: 70, strict: true, auto: false, capital: 100000, paper_command: '' }
 
 function fmt(x, digits = 2) { const n = Number(x); if (!Number.isFinite(n)) return '—'; return n.toLocaleString('en-IN', { minimumFractionDigits: digits, maximumFractionDigits: digits }) }
 function fmt0(x) { const n = Number(x); return Number.isFinite(n) ? Math.round(n).toLocaleString('en-IN') : '—' }
 function cls(value) { return String(value || 'hold').toLowerCase().replace(/\s+/g, '-') }
-function Pill({ children, tone = '' }) { return <span className={'pill ' + tone}>{children}</span> }
 function resolveSymbol(value) { const raw = String(value || '').trim().toUpperCase(); return SYMBOL_ALIASES[raw] || raw }
-function tradeLabels(action) {
-  if (action === 'SELL') return { entry: 'SELL ENTRY', stop: 'BUY STOP', target: 'BUY-TO-COVER TARGET', exit: 'BUY-TO-COVER EXIT' }
-  if (action === 'BUY') return { entry: 'BUY ENTRY', stop: 'SELL STOP', target: 'SELL TARGET', exit: 'SELL EXIT' }
-  return { entry: 'ENTRY', stop: 'STOP', target: 'TARGET', exit: 'EXIT' }
-}
-
-function IndexCard({ data }) {
-  const decision = data?.decision || 'HOLD', live = Boolean(data?.available), option = data?.option, snapshot = option?.mode === 'snapshot'
-  const labels = tradeLabels(decision)
-  return <article className="index-card">
-    <div className="index-card-top"><div><span className="eyebrow">INDEX</span><h3>{data?.name || 'INDEX'}</h3></div><Pill tone={live ? 'live' : 'muted'}>{live ? '● LIVE' : '○ OFFLINE'}</Pill></div>
-    <div className="index-price-row"><strong>₹{fmt0(data?.price)}</strong><span className={'decision ' + cls(decision)}>{decision === 'BUY' ? 'BUY / UP' : decision === 'SELL' ? 'SELL / DOWN' : 'HOLD / SIDEWAYS'}</span></div>
-    <div className="metric-row"><span>Model confidence</span><b>{data?.confidence ?? '—'}%</b></div>
-    <div className="metric-row"><span>{labels.target}</span><b>₹{fmt0(data?.target)}</b></div>
-    {snapshot ? <div className="option-box"><div className="option-title"><span>LIVE OPTION SNAPSHOT</span><b>{option.contract}</b></div><div className="option-grid"><div><small>CE LTP</small><b>₹{fmt(option.ce_premium)}</b></div><div><small>PE LTP</small><b>₹{fmt(option.pe_premium)}</b></div><div><small>CE IV</small><b>{fmt(option.ce_iv)}%</b></div><div><small>PE IV</small><b>{fmt(option.pe_iv)}%</b></div></div><div className="option-foot"><span>Expiry {option.expiry || '—'}</span><span>OI {fmt0(option.ce_oi)} / {fmt0(option.pe_oi)}</span></div></div> : option?.available ? <div className="option-box"><div className="option-title"><span>TRADE OPTION</span><b>{option.contract}</b></div><div className="option-grid"><div><small>PREMIUM</small><b>₹{fmt(option.premium)}</b></div><div><small>ENTRY</small><b>₹{fmt(option.buy_price)}</b></div><div><small>TARGET</small><b>₹{fmt(option.target_price)}</b></div><div><small>STOP</small><b>₹{fmt(option.stop_price)}</b></div></div><div className="option-foot"><span>IV {fmt(option.iv)}%</span><span>OI {fmt0(option.oi)}</span><span>VOL {fmt0(option.volume)}</span></div></div> : <div className="option-unavailable">{live ? (option?.reason || 'Live option-chain unavailable') : 'Live index data unavailable'}</div>}
-  </article>
-}
-
-function NewsPanel({ news }) {
-  const items = news?.items || [], score = Number(news?.score || 0)
-  return <article className="panel news-panel" id="news"><div className="panel-head"><div><span className="eyebrow">MARKET INTELLIGENCE</span><h2>News & Sentiment</h2></div><Pill tone={score > 0.18 ? 'bull' : score < -0.18 ? 'bear' : 'neutral'}>{news?.bias || 'NEUTRAL'} {score >= 0 ? '+' : ''}{score.toFixed(2)}</Pill></div><div className="news-summary"><div><span>Headline bias</span><b>{news?.bias || 'NEUTRAL'}</b></div><div><span>Positive</span><b>{news?.positive ?? 0}</b></div><div><span>Negative</span><b>{news?.negative ?? 0}</b></div><div><span>Feed</span><b>{news?.available ? 'LIVE' : 'OFFLINE'}</b></div></div>{items.length ? <div className="news-list">{items.slice(0, 6).map((item, i) => <a className="news-item" key={item.link || i} href={item.link || '#'} target="_blank" rel="noreferrer"><div className={'news-dot ' + (item.sentiment > 0.15 ? 'bull' : item.sentiment < -0.15 ? 'bear' : '')}></div><div><strong>{item.title}</strong><span>{item.source} · {item.published || 'recent'}</span></div></a>)}</div> : <p className="muted">{news?.reason || 'Waiting for headline feed…'}</p>}<p className="disclaimer">Headline sentiment is a confirmation/risk filter, not a standalone trading signal.</p></article>
-}
+function tradeLabels(action) { if (action === 'SELL') return { entry: 'SELL ENTRY', stop: 'BUY STOP', target: 'BUY-TO-COVER TARGET' }; if (action === 'BUY') return { entry: 'BUY ENTRY', stop: 'SELL STOP', target: 'SELL TARGET' }; return { entry: 'ENTRY', stop: 'STOP', target: 'TARGET' } }
+function Pill({ children, tone = '' }) { return <span className={'pill ' + tone}>{children}</span> }
 
 function App() {
-  const [symbol, setSymbol] = useState('RELIANCE.NS'), [qty, setQty] = useState(1), [config, setConfig] = useState(DEFAULTS), [state, setState] = useState(null), [connected, setConnected] = useState(false), [error, setError] = useState(''), [lastTick, setLastTick] = useState(null)
+  const [selected, setSelected] = useState('NIFTY 50')
+  const [qty, setQty] = useState(1)
+  const [config, setConfig] = useState(DEFAULTS)
+  const [state, setState] = useState(null)
+  const [connected, setConnected] = useState(false)
+  const [error, setError] = useState('')
+  const [lastTick, setLastTick] = useState(null)
+  const [history, setHistory] = useState(() => { try { return JSON.parse(localStorage.getItem('ml-index-paper-history') || '[]') } catch { return [] } })
   const wsRef = useRef(null)
   const clientIdRef = useRef(null)
-  if (!clientIdRef.current) { try { clientIdRef.current = localStorage.getItem('algo-paper-client-id') || crypto.randomUUID(); localStorage.setItem('algo-paper-client-id', clientIdRef.current) } catch { clientIdRef.current = 'browser-paper-session' } }
-  useEffect(() => { let ws, stopped = false, reconnect; const connect = () => { const wsUrl = API.replace(/^http/, 'ws') + '/ws?client_id=' + encodeURIComponent(clientIdRef.current); ws = new WebSocket(wsUrl); wsRef.current = ws; ws.onopen = () => { if (!stopped) { setConnected(true); setError(''); ws.send(JSON.stringify({ symbol: resolveSymbol(symbol), ...config })) } }; ws.onmessage = event => { try { const next = JSON.parse(event.data); setState(prev => ({ ...next, indices: next.indices && Object.keys(next.indices).length ? next.indices : (prev?.indices || {}) })); setLastTick(new Date()); setError(next.type === 'error' ? next.message : '') } catch { setError('Invalid server response') } }; ws.onerror = () => { if (!stopped) setError('WebSocket connection error') }; ws.onclose = () => { if (!stopped) { setConnected(false); reconnect = setTimeout(connect, 3000) } } }; connect(); return () => { stopped = true; clearTimeout(reconnect); ws?.close(); wsRef.current = null } }, [symbol])
-  useEffect(() => { if (!connected || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return; wsRef.current.send(JSON.stringify({ symbol: resolveSymbol(symbol), qty, ...config })) }, [config, qty, symbol, connected])
-  const signal = state?.signal || {}, paper = state?.position || null, news = state?.news || {}, indices = useMemo(() => Object.values(state?.indices || {}), [state]), action = signal.action || 'HOLD', newsScore = Number(news.score || 0)
-  const sendConfig = patch => setConfig(prev => ({ ...prev, ...patch }))
-  const paperOrder = command => sendConfig({ paper_command: command })
-  const mlReady = state?.model?.trained === true
-  const exitPrice = Number.isFinite(Number(signal.exit_price)) ? Number(signal.exit_price) : (action === 'BUY' || action === 'SELL' ? Number(signal.target) : null)
-  const levelLabels = tradeLabels(action)
-  const executionMode = config.auto ? 'AUTO PAPER' : 'SIGNAL-ONLY'
+  const activeTradeRef = useRef(null)
 
-  return <main className="app" id="top">
-    <header className="topbar"><div className="brand"><div className="brand-mark">AP</div><div><h1>Algo Trading <span>Pro</span></h1><p>Indian market intelligence · ML · technicals · options</p></div></div><div className="top-actions"><Pill tone={connected ? 'live' : 'bear'}>{connected ? '● MARKET LIVE' : '○ OFFLINE'}</Pill><span className="update-time">Updated {lastTick ? lastTick.toLocaleTimeString('en-IN') : '—'}</span></div></header>
-    <section className="control-bar"><div className="symbol-select"><span className="eyebrow">WATCH</span><input value={symbol} onChange={e => setSymbol(e.target.value.toUpperCase())} /></div><label>Strategy<select value={config.strategy} onChange={e => sendConfig({ strategy: e.target.value })}>{STRATEGIES.map(s => <option key={s}>{s}</option>)}</select></label><label>Risk<input type="number" step="0.1" min="0.1" max="10" value={config.risk_pct} onChange={e => sendConfig({ risk_pct: Number(e.target.value) })} /></label><label>R:R<input type="number" step="0.5" min="1" max="10" value={config.reward_r} onChange={e => sendConfig({ reward_r: Number(e.target.value) })} /></label><label>ML threshold<input type="number" min="50" max="100" value={config.threshold} onChange={e => sendConfig({ threshold: Number(e.target.value) })} /></label><label>Paper execution<select value={String(config.auto)} onChange={e => sendConfig({ auto: e.target.value === 'true' })}><option value="true">AUTO ON</option><option value="false">SIGNAL ONLY</option></select></label></section>
-    {error && <div className="error-banner">{error}</div>}
-    <section className="hero-grid" id="signals">
-      <article className={'signal-card ' + cls(action)}><div className="signal-top"><div><span className="eyebrow">PRIMARY SIGNAL</span><h2>{state?.display_symbol || symbol}</h2></div><span className="signal-state">{action}</span></div><div className="signal-price">₹{fmt(state?.price)}</div><div className="signal-sub">{action === 'BUY' ? 'Long bias' : action === 'SELL' ? 'Short bias' : 'No-trade / wait for confirmation'}</div><div className="signal-levels"><div><span>{levelLabels.entry}</span><b>₹{fmt(signal.entry)}</b></div><div><span>{levelLabels.stop}</span><b>₹{fmt(signal.stop)}</b></div><div><span>{levelLabels.target}</span><b>₹{fmt(signal.target)}</b></div><div><span>{levelLabels.exit}</span><b>₹{exitPrice == null || !Number.isFinite(exitPrice) ? '—' : fmt(exitPrice)}</b></div></div></article>
-      <article className="score-card"><div className="panel-head"><div><span className="eyebrow">DECISION ENGINE</span><h2>Signal Stack</h2></div><Pill tone={mlReady ? 'live' : 'neutral'}>{mlReady ? 'ML READY' : 'ML + TECH FALLBACK'}</Pill></div><div className="stack-row"><span>Technical structure</span><b>{action}</b></div><div className="stack-row"><span>Model probability / evidence</span><b>{signal.confidence ?? '—'}%</b></div><div className="stack-row"><span>News bias</span><b className={newsScore > .18 ? 'bull-text' : newsScore < -.18 ? 'bear-text' : ''}>{news.bias || 'NEUTRAL'} {news?.score != null ? `(${newsScore >= 0 ? '+' : ''}${newsScore.toFixed(2)})` : ''}</b></div><div className="stack-row"><span>Validation</span><b>{state?.model?.validation_accuracy != null ? `${(state.model.validation_accuracy * 100).toFixed(1)}%` : '—'}</b></div><div className="engine-note">{state?.model?.engine || 'Technical fallback while ML trains'} · {fmt0(state?.model?.samples)} training rows</div></article>
-      <article className="risk-card" id="risk"><span className="eyebrow">RISK CONTROL</span><h2>₹{fmt(config.capital, 0)}</h2><div className="risk-grid"><div><span>Risk / trade</span><b>{config.risk_pct}%</b></div><div><span>Reward</span><b>{config.reward_r}R</b></div><div><span>Paper P/L</span><b className={Number(state?.live_pnl) >= 0 ? 'bull-text' : 'bear-text'}>₹{fmt(state?.live_pnl)}</b></div><div><span>Realized</span><b>₹{fmt(state?.realized_pnl)}</b></div></div></article>
+  if (!clientIdRef.current) { try { clientIdRef.current = localStorage.getItem('algo-paper-client-id') || crypto.randomUUID(); localStorage.setItem('algo-paper-client-id', clientIdRef.current) } catch { clientIdRef.current = 'browser-paper-session' } }
+
+  useEffect(() => {
+    let ws, stopped = false, reconnect
+    const connect = () => {
+      const wsUrl = API.replace(/^http/, 'ws') + '/ws?client_id=' + encodeURIComponent(clientIdRef.current)
+      ws = new WebSocket(wsUrl); wsRef.current = ws
+      ws.onopen = () => { if (!stopped) { setConnected(true); setError(''); ws.send(JSON.stringify({ symbol: resolveSymbol(selected), qty, ...config })) } }
+      ws.onmessage = event => { try { const next = JSON.parse(event.data); setState(prev => ({ ...next, indices: next.indices && Object.keys(next.indices).length ? next.indices : (prev?.indices || {}) })); setLastTick(new Date()); setError(next.type === 'error' ? next.message : '') } catch { setError('Invalid server response') } }
+      ws.onerror = () => { if (!stopped) setError('WebSocket connection error') }
+      ws.onclose = () => { if (!stopped) { setConnected(false); reconnect = setTimeout(connect, 3000) } }
+    }
+    connect(); return () => { stopped = true; clearTimeout(reconnect); ws?.close(); wsRef.current = null }
+  }, [selected])
+
+  useEffect(() => { if (!connected || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return; wsRef.current.send(JSON.stringify({ symbol: resolveSymbol(selected), qty, ...config })) }, [config, qty, selected, connected])
+
+  const signal = state?.signal || {}
+  const paper = state?.position || null
+  const indices = useMemo(() => INDEXES.map(name => state?.indices?.[name] || { name }), [state])
+  const action = signal.action || 'HOLD'
+  const mlReady = state?.model?.trained === true
+  const confidence = Number(signal.confidence)
+  const labels = tradeLabels(action)
+  const paperPnl = Number(state?.live_pnl)
+  const signalIsQualified = mlReady && Number.isFinite(confidence) && confidence >= Number(config.threshold) && (action === 'BUY' || action === 'SELL')
+
+  const sendConfig = patch => setConfig(prev => ({ ...prev, ...patch }))
+  const selectIndex = name => { setSelected(name); setError('') }
+  const paperOrder = command => {
+    if (command !== 'CLOSE' && !signalIsQualified) { setError('Paper order blocked: wait for a qualified ML BUY/SELL signal.'); return }
+    sendConfig({ paper_command: command })
+  }
+
+  useEffect(() => {
+    if (paper && !activeTradeRef.current) activeTradeRef.current = { symbol: paper.symbol, action: paper.action, entry: Number(paper.entry), qty: Number(paper.qty), confidence: Number(paper.confidence), ml: mlReady, openedAt: paper.opened_at || Date.now() / 1000 }
+    if (!paper && activeTradeRef.current) {
+      const t = activeTradeRef.current, exit = Number(state?.price)
+      if (Number.isFinite(exit) && Number.isFinite(t.entry)) {
+        const pnl = t.action === 'BUY' ? (exit - t.entry) * t.qty : (t.entry - exit) * t.qty
+        const result = pnl > 0 ? 'CORRECT' : pnl < 0 ? 'WRONG' : 'FLAT'
+        const row = { ...t, exit, pnl, result, closedAt: Date.now() }
+        setHistory(prev => { const next = [row, ...prev].slice(0, 100); try { localStorage.setItem('ml-index-paper-history', JSON.stringify(next)) } catch {} return next })
+      }
+      activeTradeRef.current = null
+    }
+  }, [paper, state?.price, mlReady])
+
+  const mlTrades = history.filter(x => x.ml && (x.result === 'CORRECT' || x.result === 'WRONG'))
+  const correct = mlTrades.filter(x => x.result === 'CORRECT').length
+  const accuracy = mlTrades.length ? (correct / mlTrades.length) * 100 : null
+  const mlPnl = mlTrades.reduce((sum, x) => sum + Number(x.pnl || 0), 0)
+
+  return <main className="app">
+    <header className="topbar"><div><div className="eyebrow">ML PAPER TRADING LAB</div><h1>Index Signal Tester</h1><p>Only NIFTY 50 · BANK NIFTY · SENSEX · ML signal verification</p></div><div className="top-right"><Pill tone={connected ? 'live' : 'bear'}>{connected ? '● MARKET LIVE' : '○ OFFLINE'}</Pill><span>{lastTick ? lastTick.toLocaleTimeString('en-IN') : '—'}</span></div></header>
+
+    <section className="index-tabs">{INDEXES.map(name => <button key={name} className={selected === name ? 'active' : ''} onClick={() => selectIndex(name)}>{name}<small>{state?.indices?.[name]?.price != null ? `₹${fmt0(state.indices[name].price)}` : '—'}</small></button>)}</section>
+
+    <section className="focus-grid">
+      <article className={'signal-card ' + cls(action)}><div className="signal-head"><div><span className="eyebrow">ML RECOMMENDATION</span><h2>{state?.display_symbol || selected}</h2></div><span className="signal-state">{mlReady ? action : 'WAIT'}</span></div><div className="price">₹{fmt(state?.price)}</div><div className="status-row"><Pill tone={mlReady ? 'live' : 'neutral'}>{mlReady ? 'ML READY' : 'ML NOT READY'}</Pill><b>{Number.isFinite(confidence) ? `${fmt(confidence, 1)}% confidence` : 'Waiting for model'}</b></div><div className="levels"><div><span>{labels.entry}</span><b>₹{fmt(signal.entry)}</b></div><div><span>{labels.stop}</span><b>₹{fmt(signal.stop)}</b></div><div><span>{labels.target}</span><b>₹{fmt(signal.target)}</b></div></div><div className="signal-note">{mlReady ? (action === 'BUY' ? 'ML says bullish: paper BUY can test this signal.' : action === 'SELL' ? 'ML says bearish: paper SHORT can test this signal.' : 'ML says HOLD: no paper trade should be opened.') : 'Do not paper trade until the ML model is ready.'}</div></article>
+
+      <article className="paper-card"><div className="card-head"><div><span className="eyebrow">PAPER EXECUTION</span><h2>{selected}</h2></div><Pill tone={paper ? 'bull' : 'muted'}>{paper ? `${paper.action} · OPEN` : 'FLAT'}</Pill></div><div className="order-row"><label>Units<input type="number" min="1" step="1" value={qty} onChange={e => setQty(Math.max(1, Number(e.target.value) || 1))} /></label><div className="rule">Only qualified ML signals can open a paper trade.</div></div><div className="buttons"><button className="buy" disabled={!signalIsQualified || action !== 'BUY'} onClick={() => paperOrder('BUY')}>PAPER BUY</button><button className="sell" disabled={!signalIsQualified || action !== 'SELL'} onClick={() => paperOrder('SELL')}>PAPER SHORT</button><button className="close" disabled={!paper} onClick={() => paperOrder('CLOSE')}>CLOSE</button></div>{paper ? <div className="position"><div><span>POSITION</span><b>{paper.action === 'BUY' ? 'LONG' : 'SHORT'}</b></div><div><span>ENTRY</span><b>₹{fmt(paper.entry)}</b></div><div><span>LIVE P/L</span><b className={paperPnl >= 0 ? 'bull-text' : 'bear-text'}>₹{fmt(paperPnl)}</b></div><div><span>CONFIDENCE</span><b>{fmt(paper.confidence, 1)}%</b></div></div> : <div className="flat">No open paper position. This screen is for testing ML signals only.</div>}<div className="event">{state?.event || state?.execution_reason || 'Waiting for paper-trade action.'}</div></article>
     </section>
-    <section><div className="section-title"><div><span className="eyebrow">MARKET PULSE</span><h2>Indian Index Command Center</h2></div><span>NIFTY 50 · BANK NIFTY · SENSEX</span></div><div className="index-grid">{indices.length ? indices.map((d, i) => <IndexCard key={d?.name || i} data={d} />) : <div className="empty">Waiting for index data…</div>}</div></section>
-    <section className="content-grid"><NewsPanel news={news} /><article className="panel"><div className="panel-head"><div><span className="eyebrow">EXECUTION</span><h2>Paper Position</h2></div><Pill tone={paper ? 'bull' : 'muted'}>{paper ? `${paper.action} · ${paper.side}` : 'FLAT'}</Pill></div>{paper ? <><div className="position-summary"><strong>{paper.action === 'BUY' ? 'BOUGHT' : 'SHORT SOLD'} {paper.symbol}</strong><span>Opened {paper.opened_at ? new Date(paper.opened_at * 1000).toLocaleTimeString('en-IN') : '—'}</span></div><div className="position-grid"><div><small>QTY</small><b>{fmt0(paper.qty)}</b></div><div><small>ENTRY</small><b>₹{fmt(paper.entry)}</b></div><div><small>STOP</small><b>₹{fmt(paper.stop)}</b></div><div><small>TARGET</small><b>₹{fmt(paper.target)}</b></div><div><small>CONFIDENCE</small><b>{fmt(paper.confidence, 1)}%</b></div><div><small>LIVE P/L</small><b className={Number(state?.live_pnl) >= 0 ? 'bull-text' : 'bear-text'}>₹{fmt(state?.live_pnl)}</b></div></div></> : <div className="flat-state"><strong>No open paper position</strong><span>{state?.execution_reason || 'Waiting for a qualified BUY/SELL signal.'}</span></div>}<div className="event-line">{state?.event || 'No recent execution event.'}</div><div className="execution-actions"><button type="button" onClick={() => paperOrder('BUY')}>PAPER BUY</button><button type="button" onClick={() => paperOrder('SELL')}>PAPER SHORT SELL</button><button type="button" onClick={() => paperOrder('CLOSE')}>CLOSE POSITION</button></div><div className="execution-note">Mode: {executionMode} · Manual paper controls always use the live price and calculated ATR stop/target. No real-money order is placed.</div></article></section>
-    <section className="lower-grid"><article className="panel"><div className="panel-head"><div><span className="eyebrow">EXPLAINABILITY</span><h2>Why this signal?</h2></div></div><ul className="reason-list">{(signal.reasons || []).map((r, i) => <li key={i}>{r}</li>)}</ul></article><article className="panel"><div className="panel-head"><div><span className="eyebrow">ACCOUNT</span><h2>Paper Ledger</h2></div></div><div className="account-grid"><div><small>CASH</small><b>₹{fmt(state?.cash)}</b></div><div><small>REALIZED P/L</small><b>₹{fmt(state?.realized_pnl)}</b></div><div><small>POSITION</small><b>{paper ? `${paper.action} ${paper.symbol}` : 'FLAT'}</b></div><div><small>QTY</small><b>{fmt0(paper?.qty)}</b></div><div><small>ENTRY</small><b>₹{fmt(paper?.entry)}</b></div><div><small>MODE</small><b>{config.auto ? 'AUTO PAPER' : 'SIGNAL ONLY'}</b></div></div></article></section>
-    <nav className="mobile-nav"><a href="#top">⌂<span>Overview</span></a><a href="#signals">◎<span>Signals</span></a><a href="#news">◈<span>News</span></a><a href="#risk">◌<span>Risk</span></a></nav>
-    <footer>Research / paper-trading interface only. No real-money orders are placed by this dashboard.</footer>
+
+    <section className="verification"><div className="section-head"><div><span className="eyebrow">ML ACCURACY TRACKER</span><h2>Is the ML suggestion correct?</h2></div><Pill tone={mlTrades.length ? 'live' : 'neutral'}>{mlTrades.length ? `${fmt(accuracy, 1)}% ML accuracy` : 'NO ML TRADES YET'}</Pill></div><div className="stats"><div><span>ML trades tested</span><b>{mlTrades.length}</b></div><div><span>Correct</span><b className="bull-text">{correct}</b></div><div><span>Wrong</span><b className="bear-text">{mlTrades.length - correct}</b></div><div><span>Paper P/L</span><b className={mlPnl >= 0 ? 'bull-text' : 'bear-text'}>₹{fmt(mlPnl)}</b></div></div>{history.length ? <div className="history"><div className="history-title">Recent signal results</div>{history.slice(0, 8).map((x, i) => <div className="history-row" key={`${x.closedAt}-${i}`}><b>{x.symbol}</b><span>{x.action}</span><span>{x.ml ? `ML ${fmt(x.confidence, 1)}%` : 'TECH FALLBACK'}</span><span className={x.result === 'CORRECT' ? 'bull-text' : x.result === 'WRONG' ? 'bear-text' : ''}>{x.result}</span><span>₹{fmt(x.pnl)}</span></div>)}</div> : <div className="empty">No completed ML paper trades yet. Select an index, wait for ML READY + BUY/SELL confidence above the threshold, then paper trade and close it to measure correctness.</div>}</section>
+
+    <section className="mini-grid">{indices.map((d, i) => { const dAction = d?.decision || 'HOLD'; return <article key={d?.name || i} className="mini-card"><div className="mini-head"><div><span className="eyebrow">INDEX</span><h3>{d?.name || INDEXES[i]}</h3></div><Pill tone={d?.available ? 'live' : 'muted'}>{d?.available ? 'LIVE' : 'OFFLINE'}</Pill></div><strong>₹{fmt0(d?.price)}</strong><div className={'mini-decision ' + cls(dAction)}>{dAction}</div><div className="mini-line"><span>ML confidence</span><b>{d?.confidence ?? '—'}%</b></div><div className="mini-line"><span>Target</span><b>₹{fmt0(d?.target)}</b></div><button onClick={() => selectIndex(d?.name || INDEXES[i])}>TEST THIS INDEX</button></article> })}</section>
+
+    {error && <div className="error-banner">{error}</div>}<footer>Paper simulation only · No real-money order is placed · ML accuracy is counted only for trades opened while ML READY.</footer>
   </main>
 }
+
 createRoot(document.getElementById('root')).render(<App />)
