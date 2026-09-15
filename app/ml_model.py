@@ -15,8 +15,16 @@ except Exception:
     XGBClassifier = None
 
 FEATURES=["RSI_14","MACD","MACD_HIST","ATR_PCT","BB_WIDTH","VWAP_DIST","ROC_12","RET_1","RET_5","RET_20","ADX_14","STOCH_K","STOCH_D","CCI_20","EMA9_21","EMA21_50","VOLUME_RATIO"]
-MODEL_TTL_SECONDS=600; MODEL_THRESHOLD_DEFAULT=95.0; MODEL_MIN_SAMPLES=700; TRAIN_PERIOD_SECONDS=60*86400
-_MODEL_CACHE:dict[str,tuple[float,Any,dict[str,Any]]]={}; _MODEL_LOCK=threading.Lock(); _TRAINING_SYMBOLS:set[str]=set()
+MODEL_TTL_SECONDS=600
+MODEL_FAILURE_BACKOFF_SECONDS=300
+MODEL_THRESHOLD_DEFAULT=95.0
+MODEL_MIN_SAMPLES=700
+# Yahoo intraday 5-minute history is limited; 30 days is enough to exceed the
+# minimum training set while keeping Render's free CPU responsive.
+TRAIN_PERIOD_SECONDS=30*86400
+_MODEL_CACHE:dict[str,tuple[float,Any,dict[str,Any]]]={}
+_MODEL_LOCK=threading.Lock()
+_TRAINING_SYMBOLS:set[str]=set()
 
 @dataclass
 class MLSignal:
@@ -27,7 +35,7 @@ def _prepare_features(df):
     x["ATR_PCT"]=pd.to_numeric(x.get("ATR_14"),errors="coerce")/close.replace(0,np.nan)*100
     x["VWAP_DIST"]=(close-pd.to_numeric(x.get("VWAP"),errors="coerce"))/close.replace(0,np.nan)*100
     x["EMA9_21"]=(pd.to_numeric(x.get("EMA_9"),errors="coerce")/pd.to_numeric(x.get("EMA_21"),errors="coerce")-1)*100
-    x["EMA21_50"]=(pd.to_numeric(x.get("EMA_21"),errors="coerce")/pd.to_numeric(x.get("EMA_50"),errors="coerce")-1)*100
+    x["EMA21_50"]=(pd.to_numeric(x.get("EMA_21",errors="coerce"))/pd.to_numeric(x.get("EMA_50"),errors="coerce")-1)*100
     volume_sma=pd.to_numeric(x.get("VOLUME_SMA_20"),errors="coerce"); x["VOLUME_RATIO"]=volume/volume_sma.replace(0,np.nan)
     return x.replace([np.inf,-np.inf],np.nan)
 
@@ -54,16 +62,16 @@ def _fetch_training_frame(symbol):
     except Exception:return pd.DataFrame()
 
 def _make_base():
-    rf=RandomForestClassifier(n_estimators=140,max_depth=10,min_samples_leaf=6,class_weight="balanced_subsample",random_state=42,n_jobs=1)
+    rf=RandomForestClassifier(n_estimators=80,max_depth=9,min_samples_leaf=6,class_weight="balanced_subsample",random_state=42,n_jobs=1)
     if XGBClassifier is not None:
-        xgb=XGBClassifier(n_estimators=180,max_depth=4,learning_rate=0.04,subsample=0.85,colsample_bytree=0.85,min_child_weight=4,reg_lambda=2.0,objective="binary:logistic",eval_metric="logloss",tree_method="hist",n_jobs=1,random_state=42)
+        xgb=XGBClassifier(n_estimators=100,max_depth=4,learning_rate=0.04,subsample=0.85,colsample_bytree=0.85,min_child_weight=4,reg_lambda=2.0,objective="binary:logistic",eval_metric="logloss",tree_method="hist",n_jobs=1,random_state=42)
         return VotingClassifier(estimators=[("rf",rf),("xgb",xgb)],voting="soft",weights=[1.0,1.4],n_jobs=1), "RandomForest + XGBoost"
-    hgb=HistGradientBoostingClassifier(max_iter=140,learning_rate=0.035,max_leaf_nodes=15,l2_regularization=1.0,random_state=42)
+    hgb=HistGradientBoostingClassifier(max_iter=90,learning_rate=0.04,max_leaf_nodes=15,l2_regularization=1.0,random_state=42)
     return VotingClassifier(estimators=[("rf",rf),("hgb",hgb)],voting="soft",weights=[1.0,1.3],n_jobs=1), "RandomForest + HistGradientBoosting"
 
 def _calibrated_model(base,X,y):
     if y.nunique()<2 or y.value_counts().min()<3:return None
-    folds=min(3,int(y.value_counts().min()))
+    folds=min(2,int(y.value_counts().min()))
     if folds<2:return None
     splitter=StratifiedKFold(n_splits=folds,shuffle=True,random_state=42)
     model=CalibratedClassifierCV(estimator=base,method="sigmoid",cv=splitter,ensemble=True); model.fit(X,y); return model
@@ -101,7 +109,10 @@ def prewarm_ml_model(df,symbol):
     now=time.time()
     with _MODEL_LOCK:
         cached=_MODEL_CACHE.get(symbol)
-        if cached and cached[1] is not None and now-cached[0]<MODEL_TTL_SECONDS:return
+        if cached:
+            age=now-cached[0]
+            if cached[1] is not None and age<MODEL_TTL_SECONDS:return
+            if cached[1] is None and age<MODEL_FAILURE_BACKOFF_SECONDS:return
         if symbol in _TRAINING_SYMBOLS:return
         _TRAINING_SYMBOLS.add(symbol)
     try:
@@ -115,6 +126,7 @@ def predict_ml_signal(df,symbol,threshold=MODEL_THRESHOLD_DEFAULT,train_if_missi
     with _MODEL_LOCK:
         cached=_MODEL_CACHE.get(symbol)
         if cached and now-cached[0]<MODEL_TTL_SECONDS:model,meta=cached[1],cached[2]
+        elif cached and cached[1] is None and now-cached[0]<MODEL_FAILURE_BACKOFF_SECONDS:return MLSignal("HOLD",0.0,False,int(cached[2].get("samples",0)),cached[2].get("validation_accuracy"),threshold,cached[2].get("reason","Model training is temporarily backed off after a failed attempt."))
         elif not train_if_missing:return MLSignal("HOLD",0.0,False,0,None,threshold,"Model is training in the background.")
         else:model=None; meta=None
     if model is None:
