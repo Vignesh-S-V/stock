@@ -13,7 +13,7 @@ from app.news import get_news, news_confirmation
 from app.option_chain import build_option_recommendation, fetch_bse_sensex_chain, fetch_nse_chain
 from app.trading import INDEX_UNIVERSE, POPULAR_STOCKS, add_indicators, position_size, score_signal
 
-app = FastAPI(title="Algo Trading Pro API", version="1.6.0")
+app = FastAPI(title="Algo Trading Pro API", version="1.7.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=False, allow_methods=["*"], allow_headers=["*"])
 INDEX_OPTION_SYMBOLS = {"NIFTY 50": "NIFTY", "BANK NIFTY": "BANKNIFTY", "SENSEX": "SENSEX"}
 INDEX_DISPLAY_ORDER = ("NIFTY 50", "BANK NIFTY", "SENSEX")
@@ -99,8 +99,8 @@ def model_signal(x: pd.DataFrame, symbol: str, strategy: str, threshold: float, 
     if strategy != "Ensemble": return technical, None
     ml = predict_ml_signal(x, symbol, threshold=threshold, train_if_missing=False)
     if not ml.trained:
-        technical.reasons.append(f"Calibrated ML unavailable: {ml.reason}")
-        technical.reasons.append(f"Technical evidence confidence: {technical.confidence:.1f}%")
+        technical.reasons.append(f"ML unavailable: {ml.reason}")
+        technical.reasons.append(f"Technical fallback confidence: {technical.confidence:.1f}%")
         return technical, ml
     technical.action = ml.action; technical.confidence = ml.confidence
     if ml.action in {"BUY", "SELL"}:
@@ -133,7 +133,7 @@ def index_decision(name: str, ticker: str, threshold: float, reward_r: float = 2
     if x is None or spot is None: return {"name": name, "symbol": ticker, "available": False, "reason": "Live index data unavailable"}
     sig, ml = model_signal(x, ticker, "Ensemble", threshold, reward_r)
     option = build_option_recommendation(spot, sig.action, sig.target, option_chain_cached(INDEX_OPTION_SYMBOLS[name]))
-    return {"name": name, "symbol": ticker, "available": True, "price": spot, "decision": sig.action, "confidence": sig.confidence, "entry": sig.entry, "stop": sig.stop, "target": sig.target, "exit_price": exit_price_for(sig), "sell_price": sell_price_for(sig), "risk_reward": sig.risk_reward, "reasons": sig.reasons, "model": asdict(ml) if ml else None, "option": option, "timestamp": time.time()}
+    return {"name": name, "symbol": ticker, "available": True, "price": spot, "decision": sig.action, "confidence": sig.confidence, "entry": sig.entry, "stop": sig.stop, "target": sig.target, "exit_price": exit_price_for(sig), "sell_price": sell_price_for(sig), "risk_reward": sig.risk_reward, "reasons": sig.reasons, "model": asdict(ml) if ml else None, "timestamp": time.time()}
 
 async def refresh_index(name: str, ticker: str, threshold: float, reward_r: float = 2.0) -> None:
     async with _index_refresh_lock:
@@ -185,7 +185,7 @@ def execute_paper(account: PaperAccount, x: pd.DataFrame, symbol: str, strategy:
     return {"price": price, "signal": signal_data, "model": asdict(ml) if ml else None, "qualified": qualified, "position": asdict(p) if p else None, "live_pnl": live_pnl, "cash": account.cash, "realized_pnl": account.realized, "event": event, "timestamp": time.time()}
 
 @app.get("/")
-def root(): return {"service": "Algo Trading Pro API", "status": "ok", "websocket": "/ws", "version": "1.6.0"}
+def root(): return {"service": "Algo Trading Pro API", "status": "ok", "websocket": "/ws", "version": "1.7.0"}
 @app.get("/health")
 def health(): return {"status": "ok"}
 @app.get("/universe")
@@ -196,7 +196,7 @@ def news(symbol: str = "RELIANCE.NS"): return _json_safe(news_cached(symbol.uppe
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
     await ws.accept(); client_id = ws.query_params.get("client_id") or str(id(ws)); account = account_for(client_id)
-    config = {"symbol": "RELIANCE.NS", "strategy": "Ensemble", "risk_pct": 1.0, "brokerage_pct": 0.03, "reward_r": 2.0, "threshold": 95.0, "strict": True, "auto": True, "capital": 100000.0}
+    config = {"symbol": "RELIANCE.NS", "strategy": "Ensemble", "risk_pct": 1.0, "brokerage_pct": 0.03, "reward_r": 2.0, "threshold": 95.0, "strict": False, "auto": True, "capital": 100000.0}
     try:
         while True:
             try:
