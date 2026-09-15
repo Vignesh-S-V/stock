@@ -32,3 +32,5 @@ jobs:
           echo "Cloudflare credentials are configured."
       - name: Deploy to Cloudflare Workers
         run: npx --yes wrangler@latest deploy --config wrangler.toml
+
+# Credentials are supplied through GitHub Actions repository secrets.
